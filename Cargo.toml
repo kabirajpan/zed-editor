@@ -1,0 +1,21 @@
+[package]
+name = "zed-text-editor"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "zed_text_editor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zed-text-editor"
+path = "src/main.rs"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "rope_bench"
+harness = false

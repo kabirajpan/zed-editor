@@ -1,12 +1,14 @@
+pub mod tree;
+pub mod rope;
 pub mod buffer;
 pub mod editor;
 pub mod history;
-pub mod rope;
-pub mod tree;
+pub mod ui;
 
 // Re-export commonly used types
-pub use buffer::{Buffer, Offset, Point};
+pub use tree::{SumTree, Item, Summary, Count, TextSummary};
+pub use rope::{Rope, Chunk, TextMetrics};
+pub use buffer::{Buffer, Point, Offset};
 pub use editor::{Editor, Selection};
 pub use history::{History, Transaction};
-pub use rope::{Chunk, Rope, TextMetrics};
-pub use tree::{Count, Item, SumTree, Summary, TextSummary};
+pub use ui::{App, render};

@@ -11,7 +11,13 @@ path = "src/lib.rs"
 name = "zed-text-editor"
 path = "src/main.rs"
 
+[[bin]]
+name = "tui"
+path = "src/bin/tui.rs"
+
 [dependencies]
+ratatui = "0.28"
+crossterm = "0.28"
 
 [dev-dependencies]
 criterion = "0.5"

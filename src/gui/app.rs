@@ -49,36 +49,31 @@ impl GuiApp {
     }
 
     fn handle_key(&mut self, key: egui::Key, modifiers: egui::Modifiers) {
+        let cursor_before = self.editor.cursor();
+
         match key {
             egui::Key::ArrowLeft => {
                 self.editor.move_left();
-                self.auto_scroll = true;
             }
             egui::Key::ArrowRight => {
                 self.editor.move_right();
-                self.auto_scroll = true;
             }
             egui::Key::ArrowUp => {
                 self.editor.move_up();
-                self.auto_scroll = true;
             }
             egui::Key::ArrowDown => {
                 self.editor.move_down();
-                self.auto_scroll = true;
             }
             egui::Key::Home => {
                 self.editor.move_to_line_start();
-                self.auto_scroll = true;
             }
             egui::Key::End => {
                 self.editor.move_to_line_end();
-                self.auto_scroll = true;
             }
             egui::Key::Backspace => {
                 let cursor_line = self.editor.cursor().row;
                 self.editor.backspace();
                 self.status_message.clear();
-                self.auto_scroll = true;
                 self.renderer
                     .invalidate_from_line(cursor_line.saturating_sub(1));
             }
@@ -86,30 +81,26 @@ impl GuiApp {
                 let cursor_line = self.editor.cursor().row;
                 self.editor.delete();
                 self.status_message.clear();
-                self.auto_scroll = true;
                 self.renderer.invalidate_line(cursor_line);
             }
             egui::Key::Enter => {
                 let cursor_line = self.editor.cursor().row;
                 self.editor.insert("\n");
                 self.status_message.clear();
-                self.auto_scroll = true;
                 self.renderer.invalidate_from_line(cursor_line);
             }
             egui::Key::Z if modifiers.command => {
                 if self.editor.can_undo() {
                     self.editor.undo();
                     self.status_message = "Undo".to_string();
-                    self.auto_scroll = true;
-                    self.renderer.invalidate_from_line(0); // Clear all cache on undo
+                    self.renderer.invalidate_from_line(0);
                 }
             }
             egui::Key::Y if modifiers.command => {
                 if self.editor.can_redo() {
                     self.editor.redo();
                     self.status_message = "Redo".to_string();
-                    self.auto_scroll = true;
-                    self.renderer.invalidate_from_line(0); // Clear all cache on redo
+                    self.renderer.invalidate_from_line(0);
                 }
             }
             egui::Key::S if modifiers.command => {
@@ -119,6 +110,12 @@ impl GuiApp {
                 self.open_file();
             }
             _ => {}
+        }
+
+        // Only auto-scroll if cursor actually moved
+        let cursor_after = self.editor.cursor();
+        if cursor_before != cursor_after {
+            self.auto_scroll = true;
         }
     }
 

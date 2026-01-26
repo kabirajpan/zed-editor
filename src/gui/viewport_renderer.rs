@@ -120,16 +120,8 @@ impl ViewportRenderer {
         let line_height = ui.fonts(|f| f.row_height(&font_id)) + 4.0;
         let cursor_y = cursor.row as f32 * line_height;
 
-        // Version changed - invalidate cache
-        if current_version != self.last_version {
-            // Smart invalidation: only invalidate around cursor
-            let start = cursor.row.saturating_sub(10);
-            let end = cursor.row + 11;
-            for line in start..end {
-                self.line_cache.remove(&line);
-            }
-            self.last_version = current_version;
-        }
+        // Update version tracking
+        self.last_version = current_version;
 
         // Cleanup every 60 frames
         if self.frame_count % 60 == 0 {
@@ -143,6 +135,9 @@ impl ViewportRenderer {
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .drag_to_scroll(true)
+            .animated(false) // <-- Add this: disable smooth scrolling animation
             .show_viewport(ui, |ui, viewport| {
                 let total_lines = editor.line_count().max(1);
                 let content_height = total_lines as f32 * line_height;
@@ -203,13 +198,17 @@ impl ViewportRenderer {
                     }
                 }
 
-                // Auto-scroll
+                // Auto-scroll with margin (keep 1 line visible below cursor)
                 if should_auto_scroll {
+                    let scroll_margin = line_height; // 1 line margin
                     let cursor_rect = Rect::from_min_size(
-                        Pos2::new(response.rect.min.x, response.rect.min.y + cursor_y),
-                        Vec2::new(response.rect.width(), line_height),
+                        Pos2::new(
+                            response.rect.min.x,
+                            response.rect.min.y + cursor_y - scroll_margin,
+                        ),
+                        Vec2::new(response.rect.width(), line_height + (scroll_margin * 2.0)),
                     );
-                    ui.scroll_to_rect(cursor_rect, Some(egui::Align::Center));
+                    ui.scroll_to_rect(cursor_rect, None);
                 }
             });
     }
@@ -231,7 +230,7 @@ impl ViewportRenderer {
             // Empty line - just show cursor
             if cursor_blink {
                 painter.rect_filled(
-                    Rect::from_min_size(Pos2::new(x, y), Vec2::new(8.0, line_height)),
+                    Rect::from_min_size(Pos2::new(x, y), Vec2::new(2.0, line_height)),
                     0.0,
                     Color32::WHITE,
                 );
@@ -266,8 +265,7 @@ impl ViewportRenderer {
         if cursor_blink {
             let cursor_char = at_cursor.unwrap_or(' ');
             let cursor_str = cursor_char.to_string();
-            let cursor_width = self.measure_width(ui, &cursor_str, font_id).max(8.0);
-
+            let cursor_width = 2.0;
             painter.rect_filled(
                 Rect::from_min_size(Pos2::new(cursor_x, y), Vec2::new(cursor_width, line_height)),
                 0.0,

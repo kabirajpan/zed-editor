@@ -2,25 +2,27 @@ use super::line_cache_simple::LineCache;
 use super::offset::Offset;
 use super::point::Point;
 use crate::rope::Rope;
+use std::sync::Arc;
 
 /// Buffer with line offset caching for performance
+/// Uses Arc for cheap cloning (copy-on-write)
 #[derive(Clone)]
 pub struct Buffer {
-    rope: Rope,
+    rope: Arc<Rope>,
     line_cache: LineCache,
 }
 
 impl Buffer {
     pub fn new() -> Self {
         Self {
-            rope: Rope::new(),
+            rope: Arc::new(Rope::new()),
             line_cache: LineCache::new(),
         }
     }
 
     pub fn from_text(text: &str) -> Self {
         Self {
-            rope: Rope::from_text(text),
+            rope: Arc::new(Rope::from_text(text)),
             line_cache: LineCache::new(),
         }
     }
@@ -59,7 +61,9 @@ impl Buffer {
             self.line_cache.invalidate_line(line);
         }
 
-        self.rope.insert(pos, text);
+        // Copy-on-write: only clone rope if there are other Arc references
+        let rope = Arc::make_mut(&mut self.rope);
+        rope.insert(pos, text);
     }
 
     pub fn delete(&mut self, start: Offset, end: Offset) {
@@ -78,7 +82,9 @@ impl Buffer {
             self.line_cache.invalidate_line(start_line);
         }
 
-        self.rope.delete(start_pos, end_pos);
+        // Copy-on-write: only clone rope if there are other Arc references
+        let rope = Arc::make_mut(&mut self.rope);
+        rope.delete(start_pos, end_pos);
     }
 
     /// Get line by index - uses rope directly (already optimized)

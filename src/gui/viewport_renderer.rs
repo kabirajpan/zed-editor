@@ -135,9 +135,6 @@ impl ViewportRenderer {
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-            .drag_to_scroll(true)
-            .animated(false) // <-- Add this: disable smooth scrolling animation
             .show_viewport(ui, |ui, viewport| {
                 let total_lines = editor.line_count().max(1);
                 let content_height = total_lines as f32 * line_height;
@@ -279,7 +276,7 @@ impl ViewportRenderer {
                     egui::Align2::LEFT_TOP,
                     cursor_str,
                     font_id.clone(),
-                    Color32::BLACK,
+                    Color32::WHITE,
                 );
             }
         } else if let Some(ch) = at_cursor {

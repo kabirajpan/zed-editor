@@ -1,16 +1,27 @@
 use std::sync::Arc;
 
-/// A chunk of text (like Zed's 128-byte chunks)
+/// A chunk of text with cached newline positions for fast lookups
 #[derive(Clone, Debug)]
 pub struct Chunk {
     text: Arc<String>,
+    /// 🚀 CACHED newline positions for O(1) line lookups
+    newline_positions: Arc<Vec<usize>>,
 }
 
 impl Chunk {
     /// Create new chunk from string
     pub fn new(text: String) -> Self {
+        // 🚀 Build newline cache immediately
+        let newline_positions: Vec<usize> = text
+            .bytes()
+            .enumerate()
+            .filter(|(_, b)| *b == b'\n')
+            .map(|(i, _)| i)
+            .collect();
+
         Self {
             text: Arc::new(text),
+            newline_positions: Arc::new(newline_positions),
         }
     }
 
@@ -29,9 +40,19 @@ impl Chunk {
         self.text.is_empty()
     }
 
-    /// Count newlines in this chunk
+    /// 🚀 OPTIMIZED: Count newlines using cached data (O(1) instead of O(n))
     pub fn count_lines(&self) -> usize {
-        self.text.bytes().filter(|&b| b == b'\n').count()
+        self.newline_positions.len()
+    }
+
+    /// 🚀 NEW: Get newline position by index (for fast line_to_byte)
+    pub fn get_newline_position(&self, line_idx: usize) -> Option<usize> {
+        self.newline_positions.get(line_idx).copied()
+    }
+
+    /// 🚀 NEW: Get all newline positions
+    pub fn newline_positions(&self) -> &[usize] {
+        &self.newline_positions
     }
 
     /// Split chunk at position

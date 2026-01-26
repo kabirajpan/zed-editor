@@ -15,9 +15,20 @@ path = "src/main.rs"
 name = "tui"
 path = "src/bin/tui.rs"
 
+[[bin]]
+name = "gui"
+path = "src/bin/gui.rs"
+
 [dependencies]
+# TUI dependencies
 ratatui = "0.28"
 crossterm = "0.28"
+
+# GUI dependencies
+eframe = "0.29"
+egui = "0.29"
+rfd = "0.15"    # Native file dialogs
+memmap2 = "0.9"
 
 [dev-dependencies]
 criterion = "0.5"

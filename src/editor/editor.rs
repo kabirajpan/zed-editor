@@ -7,6 +7,7 @@ use crate::history::{History, Transaction};
 pub struct Editor {
     history: History,
     selection: Selection,
+    version: u64,
 }
 
 impl Editor {
@@ -15,6 +16,7 @@ impl Editor {
         Self {
             history: History::new(Buffer::new()),
             selection: Selection::cursor(Point::zero()),
+            version: 0,
         }
     }
 
@@ -23,6 +25,7 @@ impl Editor {
         Self {
             history: History::new(Buffer::from_text(text)),
             selection: Selection::cursor(Point::zero()),
+            version: 0,
         }
     }
 
@@ -46,6 +49,11 @@ impl Editor {
         self.selection
     }
 
+    /// Get current version (incremented on each edit)
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
     /// Insert text at cursor
     pub fn insert(&mut self, text: &str) {
         let cursor_before = self.cursor();
@@ -64,6 +72,7 @@ impl Editor {
         self.history.push(new_buffer, transaction);
 
         self.set_cursor(cursor_after);
+        self.version += 1;
     }
 
     /// Delete character before cursor (backspace)
@@ -100,6 +109,7 @@ impl Editor {
             self.history.push(new_buffer, transaction);
 
             self.set_cursor(cursor_after);
+            self.version += 1;
         }
     }
 
@@ -128,6 +138,8 @@ impl Editor {
             // Save to history
             let transaction = Transaction::delete(deleted_text, cursor, cursor);
             self.history.push(new_buffer, transaction);
+
+            self.version += 1;
         }
     }
 
@@ -135,6 +147,7 @@ impl Editor {
     pub fn undo(&mut self) {
         if let Some(transaction) = self.history.undo() {
             self.set_cursor(transaction.cursor_before);
+            self.version += 1;
         }
     }
 
@@ -142,6 +155,7 @@ impl Editor {
     pub fn redo(&mut self) {
         if let Some(transaction) = self.history.redo() {
             self.set_cursor(transaction.cursor_after);
+            self.version += 1;
         }
     }
 

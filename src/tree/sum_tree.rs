@@ -4,7 +4,6 @@ use std::sync::Arc;
 /// Item stored in the tree - must be able to produce a Summary
 pub trait Item: Clone {
     type Summary: Summary;
-
     fn summary(&self) -> Self::Summary;
 }
 
@@ -28,9 +27,59 @@ pub struct SumTree<T: Item> {
 }
 
 impl<T: Item> SumTree<T> {
+    const MAX_CHILDREN: usize = 8;
+
     /// Create empty tree
     pub fn new() -> Self {
         Self { root: None }
+    }
+
+    /// 🚀 NEW: Build tree from items efficiently (NO RECURSION!)
+    pub fn from_items(items: Vec<T>) -> Self {
+        if items.is_empty() {
+            return Self::new();
+        }
+
+        // Create leaf nodes
+        let mut nodes: Vec<Arc<Node<T>>> = items
+            .into_iter()
+            .map(|item| {
+                let summary = item.summary();
+                Arc::new(Node::Leaf {
+                    items: vec![item],
+                    summary,
+                })
+            })
+            .collect();
+
+        // Build tree bottom-up iteratively
+        while nodes.len() > 1 {
+            let mut next_level = Vec::new();
+
+            for chunk in nodes.chunks(Self::MAX_CHILDREN) {
+                if chunk.len() == 1 {
+                    next_level.push(chunk[0].clone());
+                } else {
+                    next_level.push(Self::create_internal(chunk.to_vec()));
+                }
+            }
+
+            nodes = next_level;
+        }
+
+        Self {
+            root: nodes.into_iter().next(),
+        }
+    }
+
+    fn create_internal(children: Vec<Arc<Node<T>>>) -> Arc<Node<T>> {
+        let mut summary = T::Summary::default();
+
+        for child in &children {
+            summary = summary.add_summary(child.summary());
+        }
+
+        Arc::new(Node::Internal { children, summary })
     }
 
     /// Get total summary of entire tree
@@ -46,7 +95,7 @@ impl<T: Item> SumTree<T> {
         self.root.is_none()
     }
 
-    /// Push item to end (simple append for now)
+    /// Push item to end (DEPRECATED - use from_items for bulk operations)
     pub fn push(&mut self, item: T) {
         let new_summary = item.summary();
         let new_leaf = Arc::new(Node::Leaf {
@@ -56,11 +105,21 @@ impl<T: Item> SumTree<T> {
 
         match self.root.take() {
             None => {
-                // Empty tree - new leaf becomes root
                 self.root = Some(new_leaf);
             }
             Some(old_root) => {
-                // Combine old root + new leaf under internal node
+                // Try to append to existing structure if possible
+                if let Node::Internal { children, .. } = old_root.as_ref() {
+                    if children.len() < Self::MAX_CHILDREN {
+                        // Can add to existing internal node
+                        let mut new_children = children.clone();
+                        new_children.push(new_leaf);
+                        self.root = Some(Self::create_internal(new_children));
+                        return;
+                    }
+                }
+
+                // Otherwise create new level
                 let combined_summary = old_root.summary().add_summary(&new_summary);
                 self.root = Some(Arc::new(Node::Internal {
                     children: vec![old_root, new_leaf],

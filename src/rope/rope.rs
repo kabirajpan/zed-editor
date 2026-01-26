@@ -1,107 +1,354 @@
 use super::chunk::Chunk;
 use crate::tree::SumTree;
 
-/// Rope - text storage using SumTree
+/// Rope - optimized text storage using SumTree
 #[derive(Clone)]
 pub struct Rope {
     tree: SumTree<Chunk>,
 }
 
 impl Rope {
-    /// Create empty rope
+    const CHUNK_SIZE: usize = 1024;
+
     pub fn new() -> Self {
         Self {
             tree: SumTree::new(),
         }
     }
 
-    /// Create rope from text
+    /// 🚀 FIXED: Build tree efficiently from text (NO STACK OVERFLOW!)
     pub fn from_text(text: &str) -> Self {
-        let mut rope = Self::new();
-        if !text.is_empty() {
-            // Split into chunks of ~128 bytes (like Zed)
-            const CHUNK_SIZE: usize = 128;
-
-            for chunk_text in text.as_bytes().chunks(CHUNK_SIZE) {
-                let chunk_str = std::str::from_utf8(chunk_text).expect("Invalid UTF-8 in text");
-                rope.tree.push(Chunk::from(chunk_str));
-            }
+        if text.is_empty() {
+            return Self::new();
         }
-        rope
+
+        // Chunk the text
+        let mut chunks = Vec::new();
+        let mut start = 0;
+
+        while start < text.len() {
+            let mut end = (start + Self::CHUNK_SIZE).min(text.len());
+
+            // Align to character boundary
+            while end < text.len() && !text.is_char_boundary(end) {
+                end += 1;
+            }
+
+            chunks.push(Chunk::from(&text[start..end]));
+            start = end;
+        }
+
+        // 🚀 Build tree in one go (balanced, iterative)
+        Self {
+            tree: SumTree::from_items(chunks),
+        }
     }
 
-    /// Get length in bytes
     pub fn len(&self) -> usize {
         self.tree.summary().len
     }
 
-    /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.tree.is_empty()
     }
 
-    /// Get number of lines
     pub fn line_count(&self) -> usize {
         self.tree.summary().lines
     }
 
-    /// Convert to string - now with proper tree traversal!
+    /// Get a specific line by index
+    pub fn line(&self, line_idx: usize) -> Option<String> {
+        let mut current_line = 0;
+        let mut line_content = String::new();
+        let mut found_line = false;
+
+        for chunk in self.tree.iter() {
+            let chunk_text = chunk.as_str();
+
+            for ch in chunk_text.chars() {
+                if current_line == line_idx {
+                    found_line = true;
+                    if ch == '\n' {
+                        return Some(line_content);
+                    }
+                    line_content.push(ch);
+                } else if ch == '\n' {
+                    current_line += 1;
+                    if current_line > line_idx {
+                        break;
+                    }
+                }
+            }
+
+            if current_line > line_idx {
+                break;
+            }
+        }
+
+        if found_line {
+            Some(line_content)
+        } else {
+            None
+        }
+    }
+
+    /// 🚀 SUPER OPTIMIZED: Get byte offset for a line using chunk newline cache
+    pub fn line_to_byte(&self, target_line: usize) -> usize {
+        if target_line == 0 {
+            return 0;
+        }
+
+        let mut current_line = 0;
+        let mut byte_offset = 0;
+
+        for chunk in self.tree.iter() {
+            let newlines_in_chunk = chunk.count_lines();
+
+            if current_line + newlines_in_chunk >= target_line {
+                // Target line is in this chunk
+                let line_in_chunk = target_line - current_line;
+
+                if line_in_chunk == 0 {
+                    return byte_offset;
+                }
+
+                // 🚀 Use cached newline position (O(1) lookup!)
+                if let Some(newline_pos) = chunk.get_newline_position(line_in_chunk - 1) {
+                    return byte_offset + newline_pos + 1;
+                }
+
+                return byte_offset + chunk.len();
+            }
+
+            current_line += newlines_in_chunk;
+            byte_offset += chunk.len();
+        }
+
+        byte_offset
+    }
+
+    /// 🚀 FIXED: Get line and column from byte offset
+    /// Returns (line, column) where column is CHARACTER count, not bytes
+    pub fn byte_to_line_col(&self, target_byte: usize) -> (usize, usize) {
+        if target_byte == 0 {
+            return (0, 0);
+        }
+
+        let mut byte_offset = 0;
+        let mut line = 0;
+        let mut column = 0;
+
+        for chunk in self.tree.iter() {
+            let chunk_len = chunk.len();
+
+            if byte_offset + chunk_len > target_byte {
+                // Found the chunk containing target_byte
+                let offset_in_chunk = target_byte - byte_offset;
+                let chunk_text = chunk.as_str();
+
+                // Count characters up to this byte offset
+                let mut bytes_counted = 0;
+
+                for ch in chunk_text.chars() {
+                    if bytes_counted >= offset_in_chunk {
+                        break;
+                    }
+                    bytes_counted += ch.len_utf8();
+
+                    if ch == '\n' {
+                        line += 1;
+                        column = 0;
+                    } else {
+                        column += 1;
+                    }
+                }
+
+                return (line, column);
+            }
+
+            // Count newlines in this chunk
+            line += chunk.count_lines();
+
+            // Set column to 0 if chunk ends with newline, otherwise count chars after last newline
+            let chunk_text = chunk.as_str();
+            if let Some(last_newline_pos) = chunk.newline_positions().last() {
+                // Count characters after last newline
+                column = chunk_text[last_newline_pos + 1..].chars().count();
+            } else {
+                // No newline in chunk - add all characters
+                column += chunk_text.chars().count();
+            }
+
+            byte_offset += chunk_len;
+        }
+
+        (line, column)
+    }
+
+    /// Convert to string (avoid on large files!)
     pub fn to_string(&self) -> String {
         let mut result = String::with_capacity(self.len());
-
         for chunk in self.tree.iter() {
             result.push_str(chunk.as_str());
         }
-
         result
     }
 
-    /// Append text to end
-    pub fn push_str(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-
-        // Split into chunks
-        const CHUNK_SIZE: usize = 128;
-
-        for chunk_text in text.as_bytes().chunks(CHUNK_SIZE) {
-            let chunk_str = std::str::from_utf8(chunk_text).expect("Invalid UTF-8 in text");
-            self.tree.push(Chunk::from(chunk_str));
-        }
-    }
-
-    /// Insert text at position (SIMPLE VERSION - rebuild tree)
-    /// TODO: Later we'll make this O(log n) with proper tree manipulation
+    /// 🚀 OPTIMIZED INSERT
     pub fn insert(&mut self, pos: usize, text: &str) {
-        assert!(pos <= self.len(), "Insert position out of bounds");
-
         if text.is_empty() {
             return;
         }
 
-        // Simple approach: convert to string, insert, rebuild
-        // This is O(n) but works for now
-        let mut content = self.to_string();
-        content.insert_str(pos, text);
-        *self = Self::from_text(&content);
-    }
-
-    /// Delete range [start, end) (SIMPLE VERSION - rebuild tree)
-    /// TODO: Later we'll make this O(log n) with proper tree manipulation
-    pub fn delete(&mut self, start: usize, end: usize) {
-        assert!(start <= end, "Start must be <= end");
-        assert!(end <= self.len(), "Delete range out of bounds");
-
-        if start == end {
+        // For small files (<1MB), simple rebuild is acceptable
+        if self.len() < 1_000_000 {
+            let mut content = self.to_string();
+            content.insert_str(pos, text);
+            *self = Self::from_text(&content);
             return;
         }
 
-        // Simple approach: convert to string, delete, rebuild
-        // This is O(n) but works for now
-        let mut content = self.to_string();
-        content.drain(start..end);
-        *self = Self::from_text(&content);
+        // For large files: Use optimized chunked insertion
+        self.insert_optimized(pos, text);
+    }
+
+    /// 🚀 Optimized insertion for large files
+    fn insert_optimized(&mut self, pos: usize, text: &str) {
+        let chunks: Vec<Chunk> = self.tree.iter().collect();
+
+        let mut current_pos = 0;
+        let mut insert_chunk_idx = 0;
+        let mut insert_offset = 0;
+
+        for (idx, chunk) in chunks.iter().enumerate() {
+            let chunk_len = chunk.as_str().len();
+            let chunk_end = current_pos + chunk_len;
+
+            if pos >= current_pos && pos < chunk_end {
+                insert_chunk_idx = idx;
+                insert_offset = pos - current_pos;
+                break;
+            }
+
+            if pos >= chunk_end {
+                insert_chunk_idx = idx + 1;
+                insert_offset = 0;
+            }
+
+            current_pos = chunk_end;
+        }
+
+        let mut new_chunks = Vec::new();
+
+        if insert_chunk_idx < chunks.len() && insert_offset > 0 {
+            for (idx, chunk) in chunks.iter().enumerate() {
+                if idx < insert_chunk_idx {
+                    new_chunks.push(chunk.clone());
+                } else if idx == insert_chunk_idx {
+                    let chunk_text = chunk.as_str();
+                    let before = &chunk_text[..insert_offset];
+                    let after = &chunk_text[insert_offset..];
+
+                    new_chunks.push(Chunk::from(before));
+
+                    let mut start = 0;
+                    while start < text.len() {
+                        let mut end = (start + Self::CHUNK_SIZE).min(text.len());
+                        while end < text.len() && !text.is_char_boundary(end) {
+                            end += 1;
+                        }
+                        new_chunks.push(Chunk::from(&text[start..end]));
+                        start = end;
+                    }
+
+                    new_chunks.push(Chunk::from(after));
+                } else {
+                    new_chunks.push(chunk.clone());
+                }
+            }
+        } else {
+            for (idx, chunk) in chunks.iter().enumerate() {
+                if idx == insert_chunk_idx {
+                    let mut start = 0;
+                    while start < text.len() {
+                        let mut end = (start + Self::CHUNK_SIZE).min(text.len());
+                        while end < text.len() && !text.is_char_boundary(end) {
+                            end += 1;
+                        }
+                        new_chunks.push(Chunk::from(&text[start..end]));
+                        start = end;
+                    }
+                }
+                new_chunks.push(chunk.clone());
+            }
+        }
+
+        self.tree = SumTree::from_items(new_chunks);
+    }
+
+    /// 🚀 OPTIMIZED DELETE
+    pub fn delete(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+
+        if self.len() < 1_000_000 {
+            let mut content = self.to_string();
+            content.drain(start..end);
+            *self = Self::from_text(&content);
+            return;
+        }
+
+        self.delete_optimized(start, end);
+    }
+
+    fn delete_optimized(&mut self, start: usize, end: usize) {
+        let mut new_chunks = Vec::new();
+        let mut current_pos = 0;
+
+        for chunk in self.tree.iter() {
+            let chunk_text = chunk.as_str();
+            let chunk_len = chunk_text.len();
+            let chunk_end = current_pos + chunk_len;
+
+            if chunk_end <= start {
+                new_chunks.push(chunk);
+            } else if current_pos >= end {
+                new_chunks.push(chunk);
+            } else {
+                let keep_start = if current_pos < start {
+                    start - current_pos
+                } else {
+                    0
+                };
+
+                let keep_end = if chunk_end > end {
+                    end - current_pos
+                } else {
+                    chunk_len
+                };
+
+                if keep_start > 0 {
+                    new_chunks.push(Chunk::from(&chunk_text[..keep_start]));
+                }
+
+                if keep_end < chunk_len {
+                    new_chunks.push(Chunk::from(&chunk_text[keep_end..]));
+                }
+            }
+
+            current_pos = chunk_end;
+        }
+
+        self.tree = SumTree::from_items(new_chunks);
+    }
+
+    pub fn chunk_count(&self) -> usize {
+        self.tree.iter().count()
+    }
+
+    pub fn memory_usage(&self) -> usize {
+        self.len() + self.chunk_count() * 64
     }
 }
 
@@ -111,7 +358,6 @@ impl Default for Rope {
     }
 }
 
-// Make Rope printable
 impl std::fmt::Display for Rope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.to_string())

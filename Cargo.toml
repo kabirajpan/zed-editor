@@ -30,6 +30,13 @@ egui = "0.29"
 rfd = "0.15"    # Native file dialogs
 memmap2 = "0.9"
 
+serde = { version = "1.0", features = ["derive"] }
+tree-sitter = "0.22"
+tree-sitter-rust = "0.21"
+tree-sitter-javascript = "0.21"
+tree-sitter-python = "0.21"
+tree-sitter-highlight = "0.22"
+
 [dev-dependencies]
 criterion = "0.5"
 

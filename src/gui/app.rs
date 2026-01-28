@@ -1,10 +1,10 @@
-use crate::{read_file, Editor};
+use crate::formatter::providers::{PrettierProvider, RustfmtProvider};
+use crate::{read_file, Editor, Formatter, SyntaxHighlighter, SyntaxTheme};
 use std::path::PathBuf;
 use std::time::Instant;
 
 use super::viewport_renderer::ViewportRenderer;
 
-/// Loading state for files
 #[derive(Clone, Debug)]
 enum LoadingState {
     Idle,
@@ -22,10 +22,18 @@ pub struct GuiApp {
     current_file: Option<PathBuf>,
     loading_state: LoadingState,
     renderer: ViewportRenderer,
+    formatter: Formatter,
+    highlighter: SyntaxHighlighter,
 }
 
 impl GuiApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let mut formatter = Formatter::new();
+        formatter.register(Box::new(RustfmtProvider::new()));
+        formatter.register(Box::new(PrettierProvider::new()));
+
+        let highlighter = SyntaxHighlighter::new(SyntaxTheme::dark());
+
         Self {
             editor: Editor::new(),
             cursor_blink: true,
@@ -35,16 +43,34 @@ impl GuiApp {
             current_file: None,
             loading_state: LoadingState::Idle,
             renderer: ViewportRenderer::new(),
+            formatter,
+            highlighter,
         }
     }
 
     fn handle_text_input(&mut self, text: &str) {
         let cursor_line = self.editor.cursor().row;
-        self.editor.insert(text);
+
+        // Auto-close brackets
+        let auto_close = match text {
+            "{" => Some("}"),
+            "[" => Some("]"),
+            "(" => Some(")"),
+            "\"" => Some("\""),
+            "'" => Some("'"),
+            _ => None,
+        };
+
+        if let Some(closing) = auto_close {
+            self.editor.insert(text);
+            self.editor.insert(closing);
+            self.editor.move_left();
+        } else {
+            self.editor.insert(text);
+        }
+
         self.status_message.clear();
         self.auto_scroll = true;
-
-        // Invalidate cache for edited line
         self.renderer.invalidate_from_line(cursor_line);
     }
 
@@ -89,33 +115,51 @@ impl GuiApp {
                 self.status_message.clear();
                 self.renderer.invalidate_from_line(cursor_line);
             }
-            egui::Key::Z if modifiers.command => {
+            egui::Key::Z if modifiers.ctrl => {
                 if self.editor.can_undo() {
                     self.editor.undo();
                     self.status_message = "Undo".to_string();
                     self.renderer.invalidate_from_line(0);
                 }
             }
-            egui::Key::Y if modifiers.command => {
+            egui::Key::Y if modifiers.ctrl => {
                 if self.editor.can_redo() {
                     self.editor.redo();
                     self.status_message = "Redo".to_string();
                     self.renderer.invalidate_from_line(0);
                 }
             }
-            egui::Key::S if modifiers.command => {
+            egui::Key::S if modifiers.ctrl => {
                 self.save_file();
             }
-            egui::Key::O if modifiers.command => {
+            egui::Key::O if modifiers.ctrl => {
                 self.open_file();
+            }
+            egui::Key::F if modifiers.ctrl && modifiers.shift => {
+                self.format_code();
             }
             _ => {}
         }
 
-        // Only auto-scroll if cursor actually moved
         let cursor_after = self.editor.cursor();
         if cursor_before != cursor_after {
             self.auto_scroll = true;
+        }
+    }
+
+    fn format_code(&mut self) {
+        if let Some(ref file_path) = self.current_file {
+            match self.editor.format(&self.formatter, Some(file_path)) {
+                Ok(_) => {
+                    self.status_message = "✨ Code formatted successfully".to_string();
+                    self.renderer.invalidate_from_line(0);
+                }
+                Err(e) => {
+                    self.status_message = format!("⚠️ Format failed: {}", e);
+                }
+            }
+        } else {
+            self.status_message = "⚠️ Save file first to enable formatting".to_string();
         }
     }
 
@@ -157,8 +201,9 @@ impl GuiApp {
             Ok(contents) => {
                 let line_count = contents.lines().count();
                 self.editor = Editor::from_text(&contents);
+                self.editor.set_file_path(Some(path.clone()));
                 self.current_file = Some(path.clone());
-                self.renderer.invalidate_from_line(0); // Clear cache for new file
+                self.renderer.invalidate_from_line(0);
 
                 let filename = path
                     .file_name()
@@ -178,14 +223,24 @@ impl GuiApp {
     }
 
     fn save_file(&mut self) {
-        if let Some(ref path) = self.current_file {
-            match crate::write_file(path, &self.editor.text()) {
+        if let Some(ref path) = self.current_file.clone() {
+            if self.formatter.find_provider(&path).is_some() {
+                match self.editor.format(&self.formatter, Some(&path)) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        self.status_message = format!("⚠️ Format failed: {}, saving anyway", e);
+                    }
+                }
+            }
+
+            match crate::write_file(&path, &self.editor.text()) {
                 Ok(_) => {
                     let filename = path
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("Unknown");
                     self.status_message = format!("💾 Saved: {}", filename);
+                    self.renderer.invalidate_from_line(0);
                 }
                 Err(e) => {
                     self.status_message = format!("❌ Error: {}", e);
@@ -200,12 +255,15 @@ impl GuiApp {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Text Files", &["txt"])
             .add_filter("Rust Files", &["rs"])
+            .add_filter("JavaScript Files", &["js"])
+            .add_filter("Python Files", &["py"])
             .add_filter("All Files", &["*"])
             .save_file()
         {
             match crate::write_file(&path, &self.editor.text()) {
                 Ok(_) => {
                     self.current_file = Some(path.clone());
+                    self.editor.set_file_path(Some(path.clone()));
                     let filename = path
                         .file_name()
                         .and_then(|n| n.to_str())
@@ -229,14 +287,12 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Cursor blink
         if self.last_blink.elapsed().as_millis() > 500 {
             self.cursor_blink = !self.cursor_blink;
             self.last_blink = Instant::now();
         }
         ctx.request_repaint();
 
-        // Input handling
         ctx.input(|i| {
             for event in &i.events {
                 match event {
@@ -256,7 +312,6 @@ impl eframe::App for GuiApp {
             }
         });
 
-        // Menu bar
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -295,6 +350,20 @@ impl eframe::App for GuiApp {
                         self.renderer.invalidate_from_line(0);
                         ui.close_menu();
                     }
+
+                    ui.separator();
+
+                    let can_format = self.current_file.is_some();
+                    if ui
+                        .add_enabled(
+                            can_format,
+                            egui::Button::new("✨ Format Code (Ctrl+Shift+F)"),
+                        )
+                        .clicked()
+                    {
+                        self.format_code();
+                        ui.close_menu();
+                    }
                 });
 
                 ui.separator();
@@ -308,7 +377,6 @@ impl eframe::App for GuiApp {
             });
         });
 
-        // Status bar
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             let cursor = self.editor.cursor();
             let status = if !self.status_message.is_empty() {
@@ -324,10 +392,14 @@ impl eframe::App for GuiApp {
             ui.label(status);
         });
 
-        // Editor
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.renderer
-                .render(ui, &self.editor, self.cursor_blink, self.auto_scroll);
+            self.renderer.render_with_highlighting(
+                ui,
+                &self.editor,
+                &mut self.highlighter,
+                self.cursor_blink,
+                self.auto_scroll,
+            );
             self.auto_scroll = false;
         });
     }

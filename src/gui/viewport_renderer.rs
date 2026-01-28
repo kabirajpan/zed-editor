@@ -1,3 +1,4 @@
+use crate::syntax::{HighlightSpan, SyntaxHighlighter};
 use egui::{Color32, FontId, Pos2, Rect, Vec2};
 use std::collections::HashMap;
 
@@ -104,11 +105,12 @@ impl ViewportRenderer {
         self.line_cache.remove(&line);
     }
 
-    /// Render viewport with optimizations
-    pub fn render(
+    /// Render viewport with syntax highlighting
+    pub fn render_with_highlighting(
         &mut self,
         ui: &mut egui::Ui,
         editor: &crate::Editor,
+        highlighter: &mut SyntaxHighlighter,
         cursor_blink: bool,
         should_auto_scroll: bool,
     ) {
@@ -132,6 +134,9 @@ impl ViewportRenderer {
                 self.width_cache.clear();
             }
         }
+
+        let full_text = editor.text();
+        let file_path = editor.file_path();
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
@@ -169,10 +174,12 @@ impl ViewportRenderer {
                         Color32::from_rgb(100, 100, 100),
                     );
 
+                    // Get syntax highlights for this line
+                    let highlights = highlighter.highlight_line(&full_text, row, file_path);
                     // Render line content
                     if row == cursor.row {
                         // Cursor line - need to handle cursor position
-                        self.render_cursor_line(
+                        self.render_cursor_line_highlighted(
                             &painter,
                             ui,
                             &line,
@@ -182,15 +189,17 @@ impl ViewportRenderer {
                             y,
                             line_height,
                             &font_id,
+                            &highlights,
                         );
                     } else if !line.is_empty() {
-                        // Regular line - single paint call
-                        painter.text(
-                            Pos2::new(text_start_x, y),
-                            egui::Align2::LEFT_TOP,
-                            line,
-                            font_id.clone(),
-                            Color32::WHITE,
+                        // Regular line with highlighting
+                        self.render_highlighted_line(
+                            &painter,
+                            &line,
+                            text_start_x,
+                            y,
+                            &font_id,
+                            &highlights,
                         );
                     }
                 }
@@ -210,8 +219,68 @@ impl ViewportRenderer {
             });
     }
 
-    /// Render line with cursor (optimized)
-    fn render_cursor_line(
+    /// Render a line with syntax highlighting
+    fn render_highlighted_line(
+        &self,
+        painter: &egui::Painter,
+        line: &str,
+        x: f32,
+        y: f32,
+        font_id: &FontId,
+        highlights: &[HighlightSpan],
+    ) {
+        if highlights.is_empty() {
+            // No highlighting - render as plain text
+            painter.text(
+                Pos2::new(x, y),
+                egui::Align2::LEFT_TOP,
+                line,
+                font_id.clone(),
+                Color32::WHITE,
+            );
+            return;
+        }
+
+        let chars: Vec<char> = line.chars().collect();
+        let mut current_x = x;
+        let mut last_end = 0;
+
+        for highlight in highlights {
+            // Render unhighlighted text before this span
+            if last_end < highlight.start {
+                let text: String = chars[last_end..highlight.start].iter().collect();
+                if !text.is_empty() {
+                    let galley =
+                        painter.layout_no_wrap(text.clone(), font_id.clone(), Color32::WHITE);
+                    painter.galley(Pos2::new(current_x, y), galley.clone(), Color32::WHITE);
+                    current_x += galley.rect.width();
+                }
+            }
+
+            // Render highlighted span
+            let span_end = highlight.end.min(chars.len());
+            let text: String = chars[highlight.start..span_end].iter().collect();
+            if !text.is_empty() {
+                let galley = painter.layout_no_wrap(text.clone(), font_id.clone(), highlight.color);
+                painter.galley(Pos2::new(current_x, y), galley.clone(), highlight.color);
+                current_x += galley.rect.width();
+            }
+
+            last_end = span_end;
+        }
+
+        // Render any remaining unhighlighted text
+        if last_end < chars.len() {
+            let text: String = chars[last_end..].iter().collect();
+            if !text.is_empty() {
+                let galley = painter.layout_no_wrap(text.clone(), font_id.clone(), Color32::WHITE);
+                painter.galley(Pos2::new(current_x, y), galley.clone(), Color32::WHITE);
+            }
+        }
+    }
+
+    /// Render line with cursor and highlighting
+    fn render_cursor_line_highlighted(
         &mut self,
         painter: &egui::Painter,
         ui: &egui::Ui,
@@ -222,6 +291,7 @@ impl ViewportRenderer {
         y: f32,
         line_height: f32,
         font_id: &FontId,
+        highlights: &[HighlightSpan],
     ) {
         if line.is_empty() {
             // Empty line - just show cursor
@@ -235,76 +305,136 @@ impl ViewportRenderer {
             return;
         }
 
-        // Split line at cursor position
         let chars: Vec<char> = line.chars().collect();
         let cursor_pos = cursor_col.min(chars.len());
 
-        let before_cursor: String = chars.iter().take(cursor_pos).collect();
-        let at_cursor = chars.get(cursor_pos).copied();
-        let after_cursor: String = chars.iter().skip(cursor_pos + 1).collect();
+        // Helper to get color for a character position
+        let get_color_at = |pos: usize| -> Color32 {
+            for highlight in highlights {
+                if pos >= highlight.start && pos < highlight.end {
+                    return highlight.color;
+                }
+            }
+            Color32::WHITE
+        };
 
-        // Measure text before cursor
-        let before_width = self.measure_width(ui, &before_cursor, font_id);
-        let cursor_x = x + before_width;
+        if highlights.is_empty() {
+            // No highlighting - simpler rendering
+            let before_cursor: String = chars.iter().take(cursor_pos).collect();
+            let at_cursor = chars.get(cursor_pos).copied();
+            let after_cursor: String = chars.iter().skip(cursor_pos + 1).collect();
 
-        // Render text before cursor
-        if !before_cursor.is_empty() {
-            painter.text(
-                Pos2::new(x, y),
-                egui::Align2::LEFT_TOP,
-                before_cursor,
-                font_id.clone(),
-                Color32::WHITE,
-            );
-        }
+            let before_width = self.measure_width(ui, &before_cursor, font_id);
+            let cursor_x = x + before_width;
 
-        // Render cursor
-        if cursor_blink {
-            let cursor_char = at_cursor.unwrap_or(' ');
-            let cursor_str = cursor_char.to_string();
-            let cursor_width = 2.0;
-            painter.rect_filled(
-                Rect::from_min_size(Pos2::new(cursor_x, y), Vec2::new(cursor_width, line_height)),
-                0.0,
-                Color32::WHITE,
-            );
-
-            // Render character on cursor (inverted color)
-            if at_cursor.is_some() {
+            if !before_cursor.is_empty() {
                 painter.text(
-                    Pos2::new(cursor_x, y),
+                    Pos2::new(x, y),
                     egui::Align2::LEFT_TOP,
-                    cursor_str,
+                    before_cursor,
                     font_id.clone(),
                     Color32::WHITE,
                 );
             }
-        } else if let Some(ch) = at_cursor {
-            // Cursor not blinking - render character normally
-            painter.text(
-                Pos2::new(cursor_x, y),
-                egui::Align2::LEFT_TOP,
-                ch.to_string(),
-                font_id.clone(),
-                Color32::WHITE,
-            );
-        }
 
-        // Render text after cursor
-        if !after_cursor.is_empty() {
-            let at_width = if let Some(ch) = at_cursor {
-                self.measure_width(ui, &ch.to_string(), font_id)
-            } else {
-                0.0
-            };
-            painter.text(
-                Pos2::new(cursor_x + at_width, y),
-                egui::Align2::LEFT_TOP,
-                after_cursor,
-                font_id.clone(),
-                Color32::WHITE,
-            );
+            // Render cursor
+            if cursor_blink {
+                painter.rect_filled(
+                    Rect::from_min_size(Pos2::new(cursor_x, y), Vec2::new(2.0, line_height)),
+                    0.0,
+                    Color32::WHITE,
+                );
+            }
+
+            let mut after_x = cursor_x;
+            if let Some(ch) = at_cursor {
+                let char_width = self.measure_width(ui, &ch.to_string(), font_id);
+                if !cursor_blink {
+                    painter.text(
+                        Pos2::new(cursor_x, y),
+                        egui::Align2::LEFT_TOP,
+                        ch.to_string(),
+                        font_id.clone(),
+                        Color32::WHITE,
+                    );
+                }
+                after_x += char_width;
+            }
+
+            if !after_cursor.is_empty() {
+                painter.text(
+                    Pos2::new(after_x, y),
+                    egui::Align2::LEFT_TOP,
+                    after_cursor,
+                    font_id.clone(),
+                    Color32::WHITE,
+                );
+            }
+        } else {
+            // With highlighting - render character by character
+            let mut current_x = x;
+            let mut cursor_x = x;
+            let mut found_cursor = false;
+
+            for (i, ch) in chars.iter().enumerate() {
+                if i == cursor_pos && !found_cursor {
+                    cursor_x = current_x;
+                    found_cursor = true;
+
+                    // Render cursor
+                    if cursor_blink {
+                        painter.rect_filled(
+                            Rect::from_min_size(
+                                Pos2::new(cursor_x, y),
+                                Vec2::new(2.0, line_height),
+                            ),
+                            0.0,
+                            Color32::WHITE,
+                        );
+                    }
+                }
+
+                let color = get_color_at(i);
+                let ch_str = ch.to_string();
+                let galley = painter.layout_no_wrap(ch_str.clone(), font_id.clone(), color);
+
+                if i != cursor_pos || !cursor_blink {
+                    painter.galley(Pos2::new(current_x, y), galley.clone(), color);
+                }
+
+                current_x += galley.rect.width();
+            }
+
+            // Cursor at end of line
+            if cursor_pos >= chars.len() && !found_cursor {
+                cursor_x = current_x;
+                if cursor_blink {
+                    painter.rect_filled(
+                        Rect::from_min_size(Pos2::new(cursor_x, y), Vec2::new(2.0, line_height)),
+                        0.0,
+                        Color32::WHITE,
+                    );
+                }
+            }
         }
+    }
+
+    /// Legacy render method without highlighting (for backward compatibility)
+    pub fn render(
+        &mut self,
+        ui: &mut egui::Ui,
+        editor: &crate::Editor,
+        cursor_blink: bool,
+        should_auto_scroll: bool,
+    ) {
+        let mut highlighter = SyntaxHighlighter::new(crate::syntax::SyntaxTheme::dark());
+        self.render_with_highlighting(
+            ui,
+            editor,
+            &mut highlighter,
+            cursor_blink,
+            should_auto_scroll,
+        );
     }
 }
 

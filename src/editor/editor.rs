@@ -1,6 +1,8 @@
 use super::selection::Selection;
 use crate::buffer::{Buffer, Offset, Point};
 use crate::history::{History, Transaction};
+use crate::syntax::IndentCalculator;
+use std::path::Path;
 
 /// Editor state - buffer + cursor + history
 #[derive(Clone)]
@@ -8,6 +10,8 @@ pub struct Editor {
     history: History,
     selection: Selection,
     version: u64,
+    indent_calculator: IndentCalculator,
+    file_path: Option<std::path::PathBuf>,
 }
 
 impl Editor {
@@ -17,6 +21,8 @@ impl Editor {
             history: History::new(Buffer::new()),
             selection: Selection::cursor(Point::zero()),
             version: 0,
+            indent_calculator: IndentCalculator::new(),
+            file_path: None,
         }
     }
 
@@ -26,7 +32,19 @@ impl Editor {
             history: History::new(Buffer::from_text(text)),
             selection: Selection::cursor(Point::zero()),
             version: 0,
+            indent_calculator: IndentCalculator::new(),
+            file_path: None,
         }
+    }
+
+    /// Set the file path (needed for language detection)
+    pub fn set_file_path(&mut self, path: Option<std::path::PathBuf>) {
+        self.file_path = path;
+    }
+
+    /// Get file path
+    pub fn file_path(&self) -> Option<&Path> {
+        self.file_path.as_deref()
     }
 
     /// Get buffer reference
@@ -54,21 +72,34 @@ impl Editor {
         self.version
     }
 
-    /// Insert text at cursor
+    /// Insert text at cursor with smart auto-indent for newlines
     pub fn insert(&mut self, text: &str) {
         let cursor_before = self.cursor();
         let offset = self.buffer().point_to_offset(cursor_before);
 
+        // Handle auto-indent for newlines using tree-sitter
+        let text_to_insert = if text == "\n" {
+            let full_text = self.buffer().to_string();
+            let indent = self.indent_calculator.calculate_indent(
+                &full_text,
+                cursor_before.row,
+                self.file_path.as_deref(),
+            );
+            format!("\n{}", indent)
+        } else {
+            text.to_string()
+        };
+
         // Create new buffer with inserted text
         let mut new_buffer = self.buffer().clone();
-        new_buffer.insert(offset, text);
+        new_buffer.insert(offset, &text_to_insert);
 
         // Move cursor after inserted text
-        let new_offset = offset.value() + text.len();
+        let new_offset = offset.value() + text_to_insert.len();
         let cursor_after = new_buffer.offset_to_point(Offset(new_offset));
 
         // Save to history
-        let transaction = Transaction::insert(text.to_string(), cursor_before, cursor_after);
+        let transaction = Transaction::insert(text_to_insert, cursor_before, cursor_after);
         self.history.push(new_buffer, transaction);
 
         self.set_cursor(cursor_after);
@@ -247,6 +278,59 @@ impl Editor {
     /// Get line count
     pub fn line_count(&self) -> usize {
         self.buffer().line_count()
+    }
+
+    /// Replace entire buffer content (used for formatting)
+    pub fn replace_all(&mut self, new_text: &str) {
+        let old_cursor = self.cursor();
+
+        // Create new buffer with formatted text
+        let new_buffer = Buffer::from_text(new_text);
+
+        // Try to preserve cursor position if possible
+        let new_cursor = if old_cursor.row < new_buffer.line_count() {
+            if let Some(line) = new_buffer.line(old_cursor.row) {
+                Point::new(old_cursor.row, old_cursor.column.min(line.len()))
+            } else {
+                Point::zero()
+            }
+        } else {
+            // Cursor was beyond new content, move to end
+            let last_row = new_buffer.line_count().saturating_sub(1);
+            if let Some(last_line) = new_buffer.line(last_row) {
+                Point::new(last_row, last_line.len())
+            } else {
+                Point::zero()
+            }
+        };
+
+        // Create transaction for undo
+        let old_text = self.text();
+        let transaction =
+            Transaction::replace(old_text, new_text.to_string(), old_cursor, new_cursor);
+
+        self.history.push(new_buffer, transaction);
+        self.set_cursor(new_cursor);
+        self.version += 1;
+    }
+
+    /// Format the buffer using provided formatter
+    pub fn format(
+        &mut self,
+        formatter: &crate::formatter::Formatter,
+        file_path: Option<&Path>,
+    ) -> Result<(), String> {
+        let current_text = self.text();
+
+        match formatter.format_text(&current_text, file_path) {
+            Ok(formatted_text) => {
+                if formatted_text != current_text {
+                    self.replace_all(&formatted_text);
+                }
+                Ok(())
+            }
+            Err(e) => Err(format!("Format failed: {:?}", e)),
+        }
     }
 }
 

@@ -5,6 +5,7 @@ use crate::buffer::Point;
 pub enum EditKind {
     Insert { text: String },
     Delete { text: String },
+    Replace { old_text: String, new_text: String },
 }
 
 /// A transaction represents a group of edits
@@ -29,6 +30,19 @@ impl Transaction {
             cursor_before,
             cursor_after,
             edit: EditKind::Delete { text },
+        }
+    }
+
+    pub fn replace(
+        old_text: String,
+        new_text: String,
+        cursor_before: Point,
+        cursor_after: Point,
+    ) -> Self {
+        Self {
+            cursor_before,
+            cursor_after,
+            edit: EditKind::Replace { old_text, new_text },
         }
     }
 }

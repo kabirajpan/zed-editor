@@ -23,6 +23,12 @@ impl History {
         &self.current
     }
 
+    /// 🚀 NEW: Update current buffer without saving to undo stack
+    /// Used for batched edits - we update the buffer live, then save to history later
+    pub fn update_current(&mut self, new_buffer: Buffer) {
+        self.current = Arc::new(new_buffer);
+    }
+
     pub fn push(&mut self, new_buffer: Buffer, transaction: Transaction) {
         self.undo_stack.push((self.current.clone(), transaction));
         self.current = Arc::new(new_buffer);

@@ -185,6 +185,99 @@ impl Rope {
         (line, column)
     }
 
+    /// 🚀 NEW: Extract a substring by byte range (EFFICIENT - no full conversion!)
+    /// This is critical for syntax highlighting performance
+    pub fn slice_bytes(&self, start: usize, end: usize) -> String {
+        if start >= end || start >= self.len() {
+            return String::new();
+        }
+
+        let end = end.min(self.len());
+        let mut result = String::new();
+        let mut current_pos = 0;
+
+        for chunk in self.tree.iter() {
+            let chunk_len = chunk.len();
+            let chunk_end = current_pos + chunk_len;
+
+            // Skip chunks before our range
+            if chunk_end <= start {
+                current_pos = chunk_end;
+                continue;
+            }
+
+            // Stop if we're past our range
+            if current_pos >= end {
+                break;
+            }
+
+            let chunk_text = chunk.as_str();
+
+            // Determine what part of this chunk to include
+            let slice_start = if current_pos < start {
+                start - current_pos
+            } else {
+                0
+            };
+
+            let slice_end = if chunk_end > end {
+                end - current_pos
+            } else {
+                chunk_len
+            };
+
+            result.push_str(&chunk_text[slice_start..slice_end]);
+            current_pos = chunk_end;
+        }
+
+        result
+    }
+
+    /// 🚀 NEW: Get byte range for a specific line (returns start, end)
+    /// Used by syntax highlighter for efficient line extraction
+    pub fn line_byte_range(&self, line_idx: usize) -> Option<(usize, usize)> {
+        let start = self.line_to_byte(line_idx);
+
+        // Find end of line
+        let mut current_line = 0;
+        let mut byte_offset = 0;
+        let mut found_start = false;
+
+        for chunk in self.tree.iter() {
+            let chunk_text = chunk.as_str();
+
+            for ch in chunk_text.chars() {
+                if current_line == line_idx {
+                    found_start = true;
+                }
+
+                if found_start && ch == '\n' {
+                    return Some((start, byte_offset));
+                }
+
+                byte_offset += ch.len_utf8();
+
+                if ch == '\n' {
+                    current_line += 1;
+                    if current_line > line_idx {
+                        break;
+                    }
+                }
+            }
+
+            if current_line > line_idx {
+                break;
+            }
+        }
+
+        // Line doesn't end with newline (last line)
+        if found_start {
+            Some((start, byte_offset))
+        } else {
+            None
+        }
+    }
+
     /// Convert to string (avoid on large files!)
     pub fn to_string(&self) -> String {
         let mut result = String::with_capacity(self.len());

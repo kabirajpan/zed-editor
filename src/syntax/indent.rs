@@ -16,6 +16,8 @@ impl IndentCalculator {
         }
     }
 
+    /// 🚀 LEGACY METHOD: Keep for backward compatibility
+    /// This still converts to string, but it's only used in non-hot paths
     pub fn calculate_indent(
         &self,
         text: &str,
@@ -36,6 +38,51 @@ impl IndentCalculator {
         };
 
         self.tree_based_indent(text, cursor_line, &tree, lang_config)
+    }
+
+    /// 🚀 NEW OPTIMIZED METHOD: Uses Rope directly with context window!
+    /// This is called on EVERY newline, so it must be fast
+    pub fn calculate_indent_with_rope(
+        &self,
+        rope: &crate::rope::Rope,
+        cursor_line: usize,
+        file_path: Option<&Path>,
+    ) -> String {
+        let Some(path) = file_path else {
+            return self.fallback_indent_with_rope(rope, cursor_line);
+        };
+
+        let Some(lang_config) = self.registry.detect_language(path) else {
+            return self.fallback_indent_with_rope(rope, cursor_line);
+        };
+
+        // 🚀 PERFORMANCE FIX: Only parse a context window, not entire file!
+        // Similar to syntax highlighter - we only need context around cursor
+        const CONTEXT_LINES: usize = 50;
+
+        let context_start_line = cursor_line.saturating_sub(CONTEXT_LINES);
+        let context_end_line = (cursor_line + CONTEXT_LINES + 1).min(rope.line_count());
+
+        let context_start_byte = rope.line_to_byte(context_start_line);
+        let context_end_byte = if context_end_line < rope.line_count() {
+            rope.line_to_byte(context_end_line)
+        } else {
+            rope.len()
+        };
+
+        // Extract ONLY the context window (not entire file!)
+        let context_text = rope.slice_bytes(context_start_byte, context_end_byte);
+
+        // Parse only the context
+        let mut parser = self.registry.create_parser(lang_config);
+        let Some(tree) = parser.parse(&context_text, None) else {
+            return self.fallback_indent_with_rope(rope, cursor_line);
+        };
+
+        // Calculate which line within context window
+        let line_in_context = cursor_line - context_start_line;
+
+        self.tree_based_indent(&context_text, line_in_context, &tree, lang_config)
     }
 
     fn tree_based_indent(
@@ -170,6 +217,31 @@ impl IndentCalculator {
             .collect()
     }
 
+    /// 🚀 NEW: Fallback indent using Rope (efficient)
+    fn fallback_indent_with_rope(&self, rope: &crate::rope::Rope, cursor_line: usize) -> String {
+        // Get just the current line efficiently
+        if let Some(line_text) = rope.line(cursor_line) {
+            let indent = Self::get_line_indent(&line_text);
+            let trimmed = line_text.trim();
+
+            let opens = trimmed.matches('{').count()
+                + trimmed.matches('[').count()
+                + trimmed.matches('(').count();
+            let closes = trimmed.matches('}').count()
+                + trimmed.matches(']').count()
+                + trimmed.matches(')').count();
+
+            if opens > closes || trimmed.ends_with(':') {
+                format!("{}{}", indent, " ".repeat(self.indent_width))
+            } else {
+                indent
+            }
+        } else {
+            String::new()
+        }
+    }
+
+    /// Original fallback for legacy string-based API
     fn fallback_indent(&self, text: &str, cursor_line: usize) -> String {
         let lines: Vec<&str> = text.lines().collect();
 

@@ -1,4 +1,5 @@
 use crate::formatter::providers::{PrettierProvider, RustfmtProvider};
+use crate::io::write_file_from_rope; // 🚀 Import new efficient rope writer
 use crate::{read_file, Editor, Formatter, SyntaxHighlighter, SyntaxTheme};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -222,8 +223,10 @@ impl GuiApp {
         }
     }
 
+    /// 🚀 PERFORMANCE-FIXED: Save file using Rope directly (no string conversion!)
     fn save_file(&mut self) {
         if let Some(ref path) = self.current_file.clone() {
+            // Format if formatter is available
             if self.formatter.find_provider(&path).is_some() {
                 match self.editor.format(&self.formatter, Some(&path)) {
                     Ok(_) => {}
@@ -233,7 +236,12 @@ impl GuiApp {
                 }
             }
 
-            match crate::write_file(&path, &self.editor.text()) {
+            // 🚀 CRITICAL FIX: Write directly from Rope without converting to String!
+            // OLD CODE:
+            // match crate::write_file(&path, &self.editor.text()) {  // ❌ Converts entire file!
+
+            // NEW CODE: Use efficient rope writer
+            match write_file_from_rope(&path, self.editor.buffer().rope()) {
                 Ok(_) => {
                     let filename = path
                         .file_name()
@@ -251,6 +259,7 @@ impl GuiApp {
         }
     }
 
+    /// 🚀 PERFORMANCE-FIXED: Save as using Rope directly
     fn save_file_as(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Text Files", &["txt"])
@@ -260,7 +269,10 @@ impl GuiApp {
             .add_filter("All Files", &["*"])
             .save_file()
         {
-            match crate::write_file(&path, &self.editor.text()) {
+            // 🚀 CRITICAL FIX: Write directly from Rope
+            // OLD CODE: match crate::write_file(&path, &self.editor.text()) {
+            // NEW CODE:
+            match write_file_from_rope(&path, self.editor.buffer().rope()) {
                 Ok(_) => {
                     self.current_file = Some(path.clone());
                     self.editor.set_file_path(Some(path.clone()));

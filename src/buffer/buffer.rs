@@ -156,6 +156,23 @@ impl Buffer {
         result
     }
 
+    /// 🚀 NEW: Get byte range for a line (efficient - for syntax highlighting)
+    pub fn line_byte_range(&self, line_idx: usize) -> Option<(usize, usize)> {
+        self.rope.line_byte_range(line_idx)
+    }
+
+    /// 🚀 NEW: Extract text from byte range (efficient - no full rope conversion)
+    /// This is critical for syntax highlighting performance
+    pub fn slice_bytes(&self, start: usize, end: usize) -> String {
+        self.rope.slice_bytes(start, end)
+    }
+
+    /// 🚀 NEW: Get the underlying rope reference (for advanced operations)
+    /// Used by viewport renderer to pass rope directly to syntax highlighter
+    pub fn rope(&self) -> &Rope {
+        &self.rope
+    }
+
     /// Print cache statistics (for debugging)
     pub fn cache_stats(&self) -> String {
         let (hits, misses, hit_rate) = self.line_cache.stats();

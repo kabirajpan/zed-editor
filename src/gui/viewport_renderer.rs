@@ -24,10 +24,18 @@ impl CachedLine {
     }
 }
 
+/// Cached highlights for a line
+#[derive(Clone)]
+struct CachedHighlights {
+    highlights: Vec<HighlightSpan>,
+    version: u64,
+}
+
 /// Fast viewport renderer with caching
 pub struct ViewportRenderer {
     line_cache: HashMap<usize, CachedLine>,
     width_cache: HashMap<String, f32>,
+    highlight_cache: HashMap<usize, CachedHighlights>,
     last_version: u64,
     frame_count: u64,
 }
@@ -37,6 +45,7 @@ impl ViewportRenderer {
         Self {
             line_cache: HashMap::new(),
             width_cache: HashMap::new(),
+            highlight_cache: HashMap::new(),
             last_version: 0,
             frame_count: 0,
         }
@@ -49,17 +58,14 @@ impl ViewportRenderer {
         line_idx: usize,
         current_version: u64,
     ) -> String {
-        // Check cache validity
         if let Some(cached) = self.line_cache.get(&line_idx) {
             if cached.is_valid(current_version) {
                 return cached.content.clone();
             }
         }
 
-        // Cache miss - fetch from editor
         let content = editor.buffer().line(line_idx).unwrap_or_default();
 
-        // Cache it
         if self.line_cache.len() < 500 {
             self.line_cache
                 .insert(line_idx, CachedLine::new(content.clone(), current_version));
@@ -74,19 +80,16 @@ impl ViewportRenderer {
             return 0.0;
         }
 
-        // Check cache
         if let Some(&width) = self.width_cache.get(text) {
             return width;
         }
 
-        // Measure
         let width = ui
             .painter()
             .layout_no_wrap(text.to_string(), font_id.clone(), Color32::WHITE)
             .rect
             .width();
 
-        // Cache it (limit cache size)
         if self.width_cache.len() < 200 {
             self.width_cache.insert(text.to_string(), width);
         }
@@ -97,15 +100,18 @@ impl ViewportRenderer {
     /// Invalidate cache on edit
     pub fn invalidate_from_line(&mut self, start_line: usize) {
         self.line_cache.retain(|&line, _| line < start_line);
+        self.highlight_cache.retain(|&line, _| line < start_line);
         self.width_cache.clear();
     }
 
     /// Invalidate specific line
     pub fn invalidate_line(&mut self, line: usize) {
         self.line_cache.remove(&line);
+        self.highlight_cache.remove(&line);
     }
 
-    /// Render viewport with syntax highlighting
+    /// 🚀 PRODUCTION-FIXED: Render viewport with syntax highlighting
+    /// This version uses Rope directly without converting entire file to String
     pub fn render_with_highlighting(
         &mut self,
         ui: &mut egui::Ui,
@@ -122,8 +128,11 @@ impl ViewportRenderer {
         let line_height = ui.fonts(|f| f.row_height(&font_id)) + 4.0;
         let cursor_y = cursor.row as f32 * line_height;
 
-        // Update version tracking
-        self.last_version = current_version;
+        // Clear caches if version changed
+        if self.last_version != current_version {
+            self.highlight_cache.clear();
+            self.last_version = current_version;
+        }
 
         // Cleanup every 60 frames
         if self.frame_count % 60 == 0 {
@@ -133,9 +142,15 @@ impl ViewportRenderer {
             if self.width_cache.len() > 200 {
                 self.width_cache.clear();
             }
+            if self.highlight_cache.len() > 500 {
+                self.highlight_cache.clear();
+            }
         }
 
-        let full_text = editor.text();
+        // 🚀 CRITICAL FIX: Get Rope reference instead of converting to String!
+        // OLD CODE: let full_text = editor.text(); // ❌ This converted entire file!
+        // NEW CODE: Use rope directly
+        let rope = editor.buffer().rope();
         let file_path = editor.file_path();
 
         egui::ScrollArea::both()
@@ -144,7 +159,6 @@ impl ViewportRenderer {
                 let total_lines = editor.line_count().max(1);
                 let content_height = total_lines as f32 * line_height;
 
-                // Virtual scrolling
                 let visible_start = (viewport.min.y / line_height).floor().max(0.0) as usize;
                 let visible_end =
                     ((viewport.max.y / line_height).ceil() as usize + 1).min(total_lines);
@@ -157,11 +171,10 @@ impl ViewportRenderer {
                 let line_number_width = 60.0;
                 let text_start_x = response.rect.min.x + line_number_width;
 
-                // Render visible lines
+                // Render visible lines only
                 for row in visible_start..visible_end {
                     let y = response.rect.min.y + row as f32 * line_height;
 
-                    // Get cached line
                     let line = self.get_line_cached(editor, row, current_version);
 
                     // Line number
@@ -174,11 +187,16 @@ impl ViewportRenderer {
                         Color32::from_rgb(100, 100, 100),
                     );
 
-                    // Get syntax highlights for this line
-                    let highlights = highlighter.highlight_line(&full_text, row, file_path);
-                    // Render line content
+                    // 🚀 Get CACHED syntax highlights - now uses Rope directly!
+                    let highlights = self.get_highlights_cached_with_rope(
+                        highlighter,
+                        rope,
+                        row,
+                        file_path,
+                        current_version,
+                    );
+
                     if row == cursor.row {
-                        // Cursor line - need to handle cursor position
                         self.render_cursor_line_highlighted(
                             &painter,
                             ui,
@@ -192,7 +210,6 @@ impl ViewportRenderer {
                             &highlights,
                         );
                     } else if !line.is_empty() {
-                        // Regular line with highlighting
                         self.render_highlighted_line(
                             &painter,
                             &line,
@@ -204,9 +221,8 @@ impl ViewportRenderer {
                     }
                 }
 
-                // Auto-scroll with margin (keep 1 line visible below cursor)
                 if should_auto_scroll {
-                    let scroll_margin = line_height; // 1 line margin
+                    let scroll_margin = line_height;
                     let cursor_rect = Rect::from_min_size(
                         Pos2::new(
                             response.rect.min.x,
@@ -217,6 +233,39 @@ impl ViewportRenderer {
                     ui.scroll_to_rect(cursor_rect, None);
                 }
             });
+    }
+
+    /// 🚀 NEW METHOD: Get highlights using Rope (efficient, no full text conversion)
+    fn get_highlights_cached_with_rope(
+        &mut self,
+        highlighter: &mut SyntaxHighlighter,
+        rope: &crate::rope::Rope,
+        line_idx: usize,
+        file_path: Option<&std::path::Path>,
+        current_version: u64,
+    ) -> Vec<HighlightSpan> {
+        // Check cache first
+        if let Some(cached) = self.highlight_cache.get(&line_idx) {
+            if cached.version == current_version {
+                return cached.highlights.clone();
+            }
+        }
+
+        // Cache miss - generate highlights using Rope (not String!)
+        let highlights = highlighter.highlight_line(rope, line_idx, file_path);
+
+        // Cache the results
+        if self.highlight_cache.len() < 500 {
+            self.highlight_cache.insert(
+                line_idx,
+                CachedHighlights {
+                    highlights: highlights.clone(),
+                    version: current_version,
+                },
+            );
+        }
+
+        highlights
     }
 
     /// Render a line with syntax highlighting
@@ -308,112 +357,68 @@ impl ViewportRenderer {
         let chars: Vec<char> = line.chars().collect();
         let cursor_pos = cursor_col.min(chars.len());
 
-        // Helper to get color for a character position
-        let get_color_at = |pos: usize| -> Color32 {
-            for highlight in highlights {
-                if pos >= highlight.start && pos < highlight.end {
-                    return highlight.color;
-                }
-            }
-            Color32::WHITE
-        };
+        // Render the line normally with highlighting
+        let mut current_x = x;
+        let mut cursor_x = x;
+        let mut last_end = 0;
+
+        // Calculate cursor X position first
+        if cursor_pos > 0 {
+            let before_cursor: String = chars[..cursor_pos].iter().collect();
+            cursor_x = x + self.measure_width(ui, &before_cursor, font_id);
+        }
 
         if highlights.is_empty() {
-            // No highlighting - simpler rendering
-            let before_cursor: String = chars.iter().take(cursor_pos).collect();
-            let at_cursor = chars.get(cursor_pos).copied();
-            let after_cursor: String = chars.iter().skip(cursor_pos + 1).collect();
-
-            let before_width = self.measure_width(ui, &before_cursor, font_id);
-            let cursor_x = x + before_width;
-
-            if !before_cursor.is_empty() {
-                painter.text(
-                    Pos2::new(x, y),
-                    egui::Align2::LEFT_TOP,
-                    before_cursor,
-                    font_id.clone(),
-                    Color32::WHITE,
-                );
-            }
-
-            // Render cursor
-            if cursor_blink {
-                painter.rect_filled(
-                    Rect::from_min_size(Pos2::new(cursor_x, y), Vec2::new(2.0, line_height)),
-                    0.0,
-                    Color32::WHITE,
-                );
-            }
-
-            let mut after_x = cursor_x;
-            if let Some(ch) = at_cursor {
-                let char_width = self.measure_width(ui, &ch.to_string(), font_id);
-                // Always show the character, even when cursor is blinking
-                painter.text(
-                    Pos2::new(cursor_x, y),
-                    egui::Align2::LEFT_TOP,
-                    ch.to_string(),
-                    font_id.clone(),
-                    Color32::WHITE,
-                );
-                after_x += char_width;
-            }
-
-            if !after_cursor.is_empty() {
-                painter.text(
-                    Pos2::new(after_x, y),
-                    egui::Align2::LEFT_TOP,
-                    after_cursor,
-                    font_id.clone(),
-                    Color32::WHITE,
-                );
-            }
+            // No highlighting - render as chunks
+            painter.text(
+                Pos2::new(x, y),
+                egui::Align2::LEFT_TOP,
+                line,
+                font_id.clone(),
+                Color32::WHITE,
+            );
         } else {
-            // With highlighting - render character by character
-            let mut current_x = x;
-            let mut cursor_x = x;
-            let mut found_cursor = false;
-
-            for (i, ch) in chars.iter().enumerate() {
-                if i == cursor_pos && !found_cursor {
-                    cursor_x = current_x;
-                    found_cursor = true;
-
-                    // Render cursor
-                    if cursor_blink {
-                        painter.rect_filled(
-                            Rect::from_min_size(
-                                Pos2::new(cursor_x, y),
-                                Vec2::new(2.0, line_height),
-                            ),
-                            0.0,
-                            Color32::WHITE,
-                        );
+            // With highlighting - render in colored chunks
+            for highlight in highlights {
+                // Render unhighlighted text before this span
+                if last_end < highlight.start {
+                    let text: String = chars[last_end..highlight.start].iter().collect();
+                    if !text.is_empty() {
+                        let galley = painter.layout_no_wrap(text, font_id.clone(), Color32::WHITE);
+                        painter.galley(Pos2::new(current_x, y), galley.clone(), Color32::WHITE);
+                        current_x += galley.rect.width();
                     }
                 }
 
-                let color = get_color_at(i);
-                let ch_str = ch.to_string();
-                let galley = painter.layout_no_wrap(ch_str.clone(), font_id.clone(), color);
+                // Render highlighted span
+                let span_end = highlight.end.min(chars.len());
+                let text: String = chars[highlight.start..span_end].iter().collect();
+                if !text.is_empty() {
+                    let galley = painter.layout_no_wrap(text, font_id.clone(), highlight.color);
+                    painter.galley(Pos2::new(current_x, y), galley.clone(), highlight.color);
+                    current_x += galley.rect.width();
+                }
 
-                // Always draw the character
-                painter.galley(Pos2::new(current_x, y), galley.clone(), color);
-
-                current_x += galley.rect.width();
+                last_end = span_end;
             }
 
-            // Cursor at end of line
-            if cursor_pos >= chars.len() && !found_cursor {
-                cursor_x = current_x;
-                if cursor_blink {
-                    painter.rect_filled(
-                        Rect::from_min_size(Pos2::new(cursor_x, y), Vec2::new(2.0, line_height)),
-                        0.0,
-                        Color32::WHITE,
-                    );
+            // Render remaining unhighlighted text
+            if last_end < chars.len() {
+                let text: String = chars[last_end..].iter().collect();
+                if !text.is_empty() {
+                    let galley = painter.layout_no_wrap(text, font_id.clone(), Color32::WHITE);
+                    painter.galley(Pos2::new(current_x, y), galley.clone(), Color32::WHITE);
                 }
             }
+        }
+
+        // Draw cursor on top
+        if cursor_blink {
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(cursor_x, y), Vec2::new(2.0, line_height)),
+                0.0,
+                Color32::WHITE,
+            );
         }
     }
 

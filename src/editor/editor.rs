@@ -3,6 +3,7 @@ use crate::buffer::{Buffer, Offset, Point};
 use crate::history::{History, Transaction};
 use crate::syntax::IndentCalculator;
 use std::path::Path;
+use std::time::Instant;
 
 /// Editor state - buffer + cursor + history
 #[derive(Clone)]
@@ -12,6 +13,11 @@ pub struct Editor {
     version: u64,
     indent_calculator: IndentCalculator,
     file_path: Option<std::path::PathBuf>,
+
+    // 🚀 NEW: Batching for undo/redo
+    pending_insert: String,
+    pending_start_cursor: Option<Point>,
+    last_edit_time: Instant,
 }
 
 impl Editor {
@@ -23,6 +29,9 @@ impl Editor {
             version: 0,
             indent_calculator: IndentCalculator::new(),
             file_path: None,
+            pending_insert: String::new(),
+            pending_start_cursor: None,
+            last_edit_time: Instant::now(),
         }
     }
 
@@ -34,6 +43,9 @@ impl Editor {
             version: 0,
             indent_calculator: IndentCalculator::new(),
             file_path: None,
+            pending_insert: String::new(),
+            pending_start_cursor: None,
+            last_edit_time: Instant::now(),
         }
     }
 
@@ -72,16 +84,63 @@ impl Editor {
         self.version
     }
 
-    /// Insert text at cursor with smart auto-indent for newlines
+    /// 🚀 NEW: Check if character is a word boundary (triggers undo save)
+    fn is_word_boundary(ch: char) -> bool {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '.' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+    }
+
+    /// 🚀 NEW: Flush pending inserts to history
+    fn flush_pending_insert(&mut self) {
+        if self.pending_insert.is_empty() {
+            return;
+        }
+
+        if let Some(start_cursor) = self.pending_start_cursor {
+            let transaction =
+                Transaction::insert(self.pending_insert.clone(), start_cursor, self.cursor());
+            // Don't push buffer here - it's already up to date
+            // We just need to record the transaction
+            self.history.push(self.buffer().clone(), transaction);
+        }
+
+        self.pending_insert.clear();
+        self.pending_start_cursor = None;
+    }
+
+    /// 🚀 OPTIMIZED: Insert text with batched undo
     pub fn insert(&mut self, text: &str) {
         let cursor_before = self.cursor();
+
+        // Check if we should flush pending (word boundary or time elapsed)
+        let should_flush = if text == "\n" {
+            true // Always flush on newline
+        } else if text.len() == 1 {
+            let ch = text.chars().next().unwrap();
+            Self::is_word_boundary(ch) || self.last_edit_time.elapsed().as_millis() > 500
+        } else {
+            true // Flush on multi-char insert
+        };
+
+        if should_flush {
+            self.flush_pending_insert();
+        }
+
+        // Start new pending batch if needed
+        if self.pending_start_cursor.is_none() {
+            self.pending_start_cursor = Some(cursor_before);
+        }
+
         let offset = self.buffer().point_to_offset(cursor_before);
 
-        // Handle auto-indent for newlines using tree-sitter
+        // Handle auto-indent for newlines
         let text_to_insert = if text == "\n" {
-            let full_text = self.buffer().to_string();
-            let indent = self.indent_calculator.calculate_indent(
-                &full_text,
+            let rope = self.buffer().rope();
+            let indent = self.indent_calculator.calculate_indent_with_rope(
+                rope,
                 cursor_before.row,
                 self.file_path.as_deref(),
             );
@@ -90,28 +149,37 @@ impl Editor {
             text.to_string()
         };
 
-        // Create new buffer with inserted text
+        // 🚀 CRITICAL: Apply edit directly WITHOUT saving to history yet!
         let mut new_buffer = self.buffer().clone();
         new_buffer.insert(offset, &text_to_insert);
 
-        // Move cursor after inserted text
+        // Move cursor
         let new_offset = offset.value() + text_to_insert.len();
         let cursor_after = new_buffer.offset_to_point(Offset(new_offset));
 
-        // Save to history
-        let transaction = Transaction::insert(text_to_insert, cursor_before, cursor_after);
-        self.history.push(new_buffer, transaction);
-
+        // Update current buffer directly (no history push yet!)
+        self.history.update_current(new_buffer);
         self.set_cursor(cursor_after);
         self.version += 1;
+        self.last_edit_time = Instant::now();
+
+        // Add to pending
+        self.pending_insert.push_str(&text_to_insert);
+
+        // Flush if word boundary
+        if should_flush {
+            self.flush_pending_insert();
+        }
     }
 
-    /// Delete character before cursor (backspace)
+    /// 🚀 OPTIMIZED: Backspace with immediate history save
     pub fn backspace(&mut self) {
+        self.flush_pending_insert(); // Flush any pending inserts
+
         let cursor = self.cursor();
 
         if cursor.row == 0 && cursor.column == 0 {
-            return; // At start of document
+            return;
         }
 
         let cursor_offset = self.buffer().point_to_offset(cursor);
@@ -119,23 +187,16 @@ impl Editor {
         if cursor_offset.value() > 0 {
             let start = Offset(cursor_offset.value() - 1);
 
-            // Get deleted text for undo
-            let deleted_text = {
-                let full_text = self.buffer().to_string();
-                full_text
-                    .chars()
-                    .nth(start.value())
-                    .unwrap_or('\0')
-                    .to_string()
-            };
+            let deleted_text = self
+                .buffer()
+                .rope()
+                .slice_bytes(start.value(), cursor_offset.value());
 
-            // Create new buffer
             let mut new_buffer = self.buffer().clone();
             new_buffer.delete(start, cursor_offset);
 
             let cursor_after = new_buffer.offset_to_point(start);
 
-            // Save to history
             let transaction = Transaction::delete(deleted_text, cursor, cursor_after);
             self.history.push(new_buffer, transaction);
 
@@ -144,29 +205,24 @@ impl Editor {
         }
     }
 
-    /// Delete character at cursor (delete key)
+    /// 🚀 OPTIMIZED: Delete with immediate history save
     pub fn delete(&mut self) {
+        self.flush_pending_insert(); // Flush any pending inserts
+
         let cursor = self.cursor();
         let cursor_offset = self.buffer().point_to_offset(cursor);
 
         if cursor_offset.value() < self.buffer().len() {
             let end = Offset(cursor_offset.value() + 1);
 
-            // Get deleted text
-            let deleted_text = {
-                let full_text = self.buffer().to_string();
-                full_text
-                    .chars()
-                    .nth(cursor_offset.value())
-                    .unwrap_or('\0')
-                    .to_string()
-            };
+            let deleted_text = self
+                .buffer()
+                .rope()
+                .slice_bytes(cursor_offset.value(), end.value());
 
-            // Create new buffer
             let mut new_buffer = self.buffer().clone();
             new_buffer.delete(cursor_offset, end);
 
-            // Save to history
             let transaction = Transaction::delete(deleted_text, cursor, cursor);
             self.history.push(new_buffer, transaction);
 
@@ -176,6 +232,8 @@ impl Editor {
 
     /// Undo last operation
     pub fn undo(&mut self) {
+        self.flush_pending_insert(); // Flush before undo
+
         if let Some(transaction) = self.history.undo() {
             self.set_cursor(transaction.cursor_before);
             self.version += 1;
@@ -184,6 +242,8 @@ impl Editor {
 
     /// Redo last undone operation
     pub fn redo(&mut self) {
+        self.flush_pending_insert(); // Flush before redo
+
         if let Some(transaction) = self.history.redo() {
             self.set_cursor(transaction.cursor_after);
             self.version += 1;
@@ -202,6 +262,8 @@ impl Editor {
 
     /// Move cursor left
     pub fn move_left(&mut self) {
+        self.flush_pending_insert(); // Flush on cursor movement
+
         let cursor = self.cursor();
 
         if cursor.column > 0 {
@@ -215,6 +277,8 @@ impl Editor {
 
     /// Move cursor right
     pub fn move_right(&mut self) {
+        self.flush_pending_insert(); // Flush on cursor movement
+
         let cursor = self.cursor();
 
         if let Some(current_line) = self.buffer().line(cursor.row) {
@@ -228,6 +292,8 @@ impl Editor {
 
     /// Move cursor up
     pub fn move_up(&mut self) {
+        self.flush_pending_insert(); // Flush on cursor movement
+
         let cursor = self.cursor();
 
         if cursor.row > 0 {
@@ -243,6 +309,8 @@ impl Editor {
 
     /// Move cursor down
     pub fn move_down(&mut self) {
+        self.flush_pending_insert(); // Flush on cursor movement
+
         let cursor = self.cursor();
 
         if cursor.row + 1 < self.buffer().line_count() {
@@ -258,12 +326,16 @@ impl Editor {
 
     /// Move cursor to start of line
     pub fn move_to_line_start(&mut self) {
+        self.flush_pending_insert();
+
         let cursor = self.cursor();
         self.set_cursor(Point::new(cursor.row, 0));
     }
 
     /// Move cursor to end of line
     pub fn move_to_line_end(&mut self) {
+        self.flush_pending_insert();
+
         let cursor = self.cursor();
         if let Some(line) = self.buffer().line(cursor.row) {
             self.set_cursor(Point::new(cursor.row, line.len()));
@@ -282,12 +354,12 @@ impl Editor {
 
     /// Replace entire buffer content (used for formatting)
     pub fn replace_all(&mut self, new_text: &str) {
+        self.flush_pending_insert();
+
         let old_cursor = self.cursor();
 
-        // Create new buffer with formatted text
         let new_buffer = Buffer::from_text(new_text);
 
-        // Try to preserve cursor position if possible
         let new_cursor = if old_cursor.row < new_buffer.line_count() {
             if let Some(line) = new_buffer.line(old_cursor.row) {
                 Point::new(old_cursor.row, old_cursor.column.min(line.len()))
@@ -295,7 +367,6 @@ impl Editor {
                 Point::zero()
             }
         } else {
-            // Cursor was beyond new content, move to end
             let last_row = new_buffer.line_count().saturating_sub(1);
             if let Some(last_line) = new_buffer.line(last_row) {
                 Point::new(last_row, last_line.len())
@@ -304,7 +375,6 @@ impl Editor {
             }
         };
 
-        // Create transaction for undo
         let old_text = self.text();
         let transaction =
             Transaction::replace(old_text, new_text.to_string(), old_cursor, new_cursor);

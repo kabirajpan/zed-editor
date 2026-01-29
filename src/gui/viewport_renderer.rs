@@ -349,15 +349,14 @@ impl ViewportRenderer {
             let mut after_x = cursor_x;
             if let Some(ch) = at_cursor {
                 let char_width = self.measure_width(ui, &ch.to_string(), font_id);
-                if !cursor_blink {
-                    painter.text(
-                        Pos2::new(cursor_x, y),
-                        egui::Align2::LEFT_TOP,
-                        ch.to_string(),
-                        font_id.clone(),
-                        Color32::WHITE,
-                    );
-                }
+                // Always show the character, even when cursor is blinking
+                painter.text(
+                    Pos2::new(cursor_x, y),
+                    egui::Align2::LEFT_TOP,
+                    ch.to_string(),
+                    font_id.clone(),
+                    Color32::WHITE,
+                );
                 after_x += char_width;
             }
 
@@ -398,9 +397,8 @@ impl ViewportRenderer {
                 let ch_str = ch.to_string();
                 let galley = painter.layout_no_wrap(ch_str.clone(), font_id.clone(), color);
 
-                if i != cursor_pos || !cursor_blink {
-                    painter.galley(Pos2::new(current_x, y), galley.clone(), color);
-                }
+                // Always draw the character
+                painter.galley(Pos2::new(current_x, y), galley.clone(), color);
 
                 current_x += galley.rect.width();
             }

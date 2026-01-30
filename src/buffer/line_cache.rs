@@ -1,11 +1,11 @@
 // src/buffer/line_cache.rs
-use crate::buffer::Rope;
+use crate::rope::Rope;
 
 use std::ops::Range;
 
 /// 🚀 ZERO-ALLOCATION LINE OFFSET CACHE
 /// Replaces HashMap with array-based cache for 10x performance
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LineOffsetCache {
     // 🚀 ARRAY-BASED STORAGE (no HashMap allocations)
     cached_offsets: Vec<Option<usize>>, // line_index -> byte_offset
@@ -24,7 +24,7 @@ pub enum ScrollDirection {
     Stationary,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PredictiveCache {
     pub visible_range: std::ops::Range<usize>, // Currently visible lines
     pub precalc_range: std::ops::Range<usize>, // Lines to pre-calculate (±200)
@@ -34,7 +34,7 @@ pub struct PredictiveCache {
 }
 
 /// 🚀 REUSABLE BUFFER to avoid allocations during rendering
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReusableBuffer {
     pub buffer: Vec<usize>,
     last_used: std::time::Instant,

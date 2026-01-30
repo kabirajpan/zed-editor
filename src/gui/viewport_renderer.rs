@@ -1,4 +1,4 @@
-use crate::syntax::{Highlight, HighlightedRange, InstantHighlighter};
+use crate::syntax::{HighlightedRange, InstantHighlighter};
 use egui::{Color32, FontId, Pos2, Rect, Vec2};
 use std::collections::HashMap;
 
@@ -24,10 +24,10 @@ impl CachedLine {
     }
 }
 
-/// Cached highlights for a line
+/// 🚀 NEW: Cached line offset (line number -> byte offset)
 #[derive(Clone)]
-struct CachedHighlights {
-    highlights: Vec<HighlightedRange>,
+struct CachedLineOffset {
+    offset: usize,
     version: u64,
 }
 
@@ -35,10 +35,14 @@ struct CachedHighlights {
 pub struct ViewportRenderer {
     line_cache: HashMap<usize, CachedLine>,
     width_cache: HashMap<String, f32>,
-    highlight_cache: HashMap<usize, CachedHighlights>,
+    // 🚀 NEW: Cache line_to_byte conversions (this is the expensive operation!)
+    line_offset_cache: HashMap<usize, CachedLineOffset>,
     last_version: u64,
     frame_count: u64,
-    highlighter: InstantHighlighter, // 🚀 NEW: Built-in fast highlighter
+    highlighter: InstantHighlighter,
+    predictive_cache: crate::buffer::PredictiveCache,
+    last_viewport: (usize, usize),
+    last_cursor_line: usize,
 }
 
 impl ViewportRenderer {
@@ -46,11 +50,45 @@ impl ViewportRenderer {
         Self {
             line_cache: HashMap::new(),
             width_cache: HashMap::new(),
-            highlight_cache: HashMap::new(),
+            line_offset_cache: HashMap::new(),
             last_version: 0,
             frame_count: 0,
-            highlighter: InstantHighlighter::new(), // 🚀 Initialize once
+            highlighter: InstantHighlighter::new(),
+            predictive_cache: crate::buffer::PredictiveCache::new(),
+            last_viewport: (0, 0),
+            last_cursor_line: 0,
         }
+    }
+
+    /// 🚀 NEW: Get line offset with caching (avoids expensive rope scans!)
+    fn get_line_offset_cached(
+        &mut self,
+        rope: &crate::rope::Rope,
+        line_idx: usize,
+        current_version: u64,
+    ) -> usize {
+        // Check cache first
+        if let Some(cached) = self.line_offset_cache.get(&line_idx) {
+            if cached.version == current_version {
+                return cached.offset;
+            }
+        }
+
+        // Cache miss - calculate and store
+        let offset = rope.line_to_byte(line_idx);
+
+        // Only cache if we have room (prevent unbounded growth)
+        if self.line_offset_cache.len() < 10_000 {
+            self.line_offset_cache.insert(
+                line_idx,
+                CachedLineOffset {
+                    offset,
+                    version: current_version,
+                },
+            );
+        }
+
+        offset
     }
 
     /// Get or cache a line
@@ -102,14 +140,14 @@ impl ViewportRenderer {
     /// Invalidate cache on edit
     pub fn invalidate_from_line(&mut self, start_line: usize) {
         self.line_cache.retain(|&line, _| line < start_line);
-        self.highlight_cache.retain(|&line, _| line < start_line);
+        self.line_offset_cache.retain(|&line, _| line < start_line);
         self.width_cache.clear();
     }
 
     /// Invalidate specific line
     pub fn invalidate_line(&mut self, line: usize) {
         self.line_cache.remove(&line);
-        self.highlight_cache.remove(&line);
+        self.line_offset_cache.remove(&line);
     }
 
     /// 🚀 ULTRA-OPTIMIZED: Render viewport with FAST regex-based syntax highlighting
@@ -131,7 +169,8 @@ impl ViewportRenderer {
 
         // Clear caches if version changed
         if self.last_version != current_version {
-            self.highlight_cache.clear();
+            // Clear line offset cache on version change
+            self.line_offset_cache.clear();
             self.last_version = current_version;
         }
 
@@ -143,8 +182,12 @@ impl ViewportRenderer {
             if self.width_cache.len() > 200 {
                 self.width_cache.clear();
             }
-            if self.highlight_cache.len() > 500 {
-                self.highlight_cache.clear();
+            if self.line_offset_cache.len() > 10_000 {
+                // Keep only viewport lines and nearby buffer
+                let viewport_start = self.last_viewport.0.saturating_sub(100);
+                let viewport_end = self.last_viewport.1 + 100;
+                self.line_offset_cache
+                    .retain(|k, _| *k >= viewport_start && *k <= viewport_end);
             }
         }
 
@@ -160,6 +203,56 @@ impl ViewportRenderer {
                 let visible_end =
                     ((viewport.max.y / line_height).ceil() as usize + 1).min(total_lines);
 
+                // 🚀 SCROLL PREDICTION: Track scroll delta for predictive caching
+                let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+                let frame_time = ui.input(|i| i.stable_dt);
+
+                // Detect viewport changes (scrollbar drag or smooth scroll)
+                let viewport_changed =
+                    self.last_viewport.0 != visible_start || self.last_viewport.1 != visible_end;
+
+                if viewport_changed || scroll_delta.abs() > 0.1 {
+                    self.predictive_cache.update_scroll_prediction(
+                        visible_start..visible_end,
+                        scroll_delta,
+                        frame_time,
+                    );
+                    self.last_viewport = (visible_start, visible_end);
+
+                    // 🚀 PRE-CACHE: When scrolling, pre-cache line offsets in scroll direction
+                    let rope = editor.buffer().rope();
+                    let precache_range = if scroll_delta < -0.1 {
+                        // Scrolling up - pre-cache lines above
+                        let start = visible_start.saturating_sub(100);
+                        let end = visible_start;
+                        start..end
+                    } else if scroll_delta > 0.1 {
+                        // Scrolling down - pre-cache lines below
+                        let start = visible_end;
+                        let end = (visible_end + 100).min(total_lines);
+                        start..end
+                    } else {
+                        // Big jump (scrollbar drag) - cache visible range
+                        visible_start..visible_end
+                    };
+
+                    // Pre-cache the predicted range
+                    for line_idx in precache_range {
+                        if !self.line_offset_cache.contains_key(&line_idx) {
+                            let offset = rope.line_to_byte(line_idx);
+                            if self.line_offset_cache.len() < 10_000 {
+                                self.line_offset_cache.insert(
+                                    line_idx,
+                                    CachedLineOffset {
+                                        offset,
+                                        version: current_version,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+
                 let (response, painter) = ui.allocate_painter(
                     Vec2::new(ui.available_width(), content_height),
                     egui::Sense::click(),
@@ -168,8 +261,7 @@ impl ViewportRenderer {
                 let line_number_width = 60.0;
                 let text_start_x = response.rect.min.x + line_number_width;
 
-                // 🚀 CRITICAL OPTIMIZATION: Get highlights for entire visible region at once!
-                // This is 100x faster than per-line tree-sitter parsing
+                // 🚀 SIMPLIFIED: Just calculate highlights for visible region (regex is fast!)
                 let language = InstantHighlighter::detect_language(file_path);
                 let highlights = self.get_highlights_for_viewport(
                     editor,
@@ -196,7 +288,8 @@ impl ViewportRenderer {
                     );
 
                     // Get highlights for this specific line
-                    let line_highlights = self.filter_highlights_for_line(&highlights, editor, row);
+                    let line_highlights =
+                        self.filter_highlights_for_line(&highlights, editor, row, current_version);
 
                     if row == cursor.row {
                         self.render_cursor_line_highlighted(
@@ -237,7 +330,8 @@ impl ViewportRenderer {
             });
     }
 
-    /// 🚀 NEW: Get highlights for entire viewport at once (FAST!)
+    /// 🚀 SIMPLIFIED: No caching - just calculate fresh (regex is fast!)
+    /// This matches the old editor's proven approach
     fn get_highlights_for_viewport(
         &mut self,
         editor: &crate::Editor,
@@ -246,29 +340,23 @@ impl ViewportRenderer {
         language: &str,
         current_version: u64,
     ) -> Vec<HighlightedRange> {
-        // Calculate byte range for visible region
         let rope = editor.buffer().rope();
-        let visible_start_byte = rope.line_to_byte(visible_start);
+
+        // 🚀 USE CACHED line_to_byte calls!
+        let visible_start_byte = self.get_line_offset_cached(rope, visible_start, current_version);
         let visible_end_byte = if visible_end < editor.line_count() {
-            rope.line_to_byte(visible_end)
+            self.get_line_offset_cached(rope, visible_end, current_version)
         } else {
             rope.len()
         };
 
-        // Get only the visible text (not entire file!)
         let visible_text = rope.slice_bytes(visible_start_byte, visible_end_byte);
 
-        // 🚀 FAST: Regex-based highlighting (1000x faster than tree-sitter!)
+        // 🚀 ALWAYS FRESH: Regex is fast enough, caching adds overhead
         self.highlighter
-            .highlight_visible_region(
-                &visible_text,
-                0, // Start from beginning of slice
-                visible_text.len(),
-                language,
-            )
+            .highlight_visible_region(&visible_text, 0, visible_text.len(), language)
             .into_iter()
             .map(|mut h| {
-                // Adjust byte offsets to account for visible_start_byte
                 h.start += visible_start_byte;
                 h.end += visible_start_byte;
                 h
@@ -276,18 +364,21 @@ impl ViewportRenderer {
             .collect()
     }
 
-    /// 🚀 NEW: Filter highlights to only those affecting a specific line
+    /// 🚀 Filter highlights to only those affecting a specific line
     fn filter_highlights_for_line(
-        &self,
+        &mut self,
         highlights: &[HighlightedRange],
         editor: &crate::Editor,
         line_idx: usize,
+        current_version: u64,
     ) -> Vec<(usize, usize, Color32)> {
         let rope = editor.buffer().rope();
-        let line_start_byte = rope.line_to_byte(line_idx);
+
+        // 🚀 USE CACHED line_to_byte calls!
+        let line_start_byte = self.get_line_offset_cached(rope, line_idx, current_version);
 
         let line_end_byte = if line_idx + 1 < editor.line_count() {
-            rope.line_to_byte(line_idx + 1)
+            self.get_line_offset_cached(rope, line_idx + 1, current_version)
         } else {
             rope.len()
         };

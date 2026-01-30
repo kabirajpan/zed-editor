@@ -440,6 +440,16 @@ impl Rope {
         self.tree.iter().count()
     }
 
+    /// 🚀 NEW: Call a function for each chunk (zero-copy)
+    pub fn for_each_chunk<F>(&self, mut f: F)
+    where
+        F: FnMut(&str),
+    {
+        for chunk in self.tree.iter() {
+            f(chunk.as_str());
+        }
+    }
+
     pub fn memory_usage(&self) -> usize {
         self.len() + self.chunk_count() * 64
     }

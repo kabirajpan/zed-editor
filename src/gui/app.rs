@@ -408,7 +408,6 @@ impl eframe::App for GuiApp {
             self.renderer.render_with_highlighting(
                 ui,
                 &self.editor,
-                &mut self.highlighter,
                 self.cursor_blink,
                 self.auto_scroll,
             );

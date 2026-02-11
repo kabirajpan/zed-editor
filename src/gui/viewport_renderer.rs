@@ -564,8 +564,11 @@ impl ViewportRenderer {
 
         // Draw cursor on top
         if cursor_blink {
+            // ✅ Reduced cursor height to 85% of line height, centered vertically
+            let cursor_height = line_height * 0.85;
+            let cursor_y_offset = (line_height - cursor_height) / 2.0;
             painter.rect_filled(
-                Rect::from_min_size(Pos2::new(cursor_x, y), Vec2::new(2.0, line_height)),
+                Rect::from_min_size(Pos2::new(cursor_x, y + cursor_y_offset), Vec2::new(2.0, cursor_height)),
                 0.0,
                 Color32::WHITE,
             );

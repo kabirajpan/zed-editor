@@ -303,8 +303,8 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ✅ Only blink cursor if user hasn't typed for 500ms (cursor pauses after typing)
-        let is_typing = self.last_input_time.elapsed().as_millis() < 500;
+        // ✅ Only blink cursor if user hasn't typed for 800ms (500ms grace + 300ms delay before blink)
+        let is_typing = self.last_input_time.elapsed().as_millis() < 800;
         
         if !is_typing && self.last_blink.elapsed().as_millis() > 500 {
             self.cursor_blink = !self.cursor_blink;

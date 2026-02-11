@@ -277,7 +277,8 @@ impl Editor {
 
     /// Check if can undo
     pub fn can_undo(&self) -> bool {
-        self.history.can_undo()
+        // Can undo if we have pending text OR history has entries
+        !self.pending_insert.is_empty() || self.history.can_undo()
     }
 
     /// Check if can redo

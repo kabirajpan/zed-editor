@@ -219,22 +219,24 @@ impl IndentCalculator {
 
     /// 🚀 NEW: Fallback indent using Rope (efficient)
     fn fallback_indent_with_rope(&self, rope: &crate::rope::Rope, cursor_line: usize) -> String {
-        // Get just the current line efficiently
+        // Simple logic: check the current line
+        // If it has MORE opening brackets than closing, add indent
         if let Some(line_text) = rope.line(cursor_line) {
-            let indent = Self::get_line_indent(&line_text);
             let trimmed = line_text.trim();
-
+            
+            // Count brackets
             let opens = trimmed.matches('{').count()
                 + trimmed.matches('[').count()
                 + trimmed.matches('(').count();
             let closes = trimmed.matches('}').count()
                 + trimmed.matches(']').count()
                 + trimmed.matches(')').count();
-
-            if opens > closes || trimmed.ends_with(':') {
-                format!("{}{}", indent, " ".repeat(self.indent_width))
+            
+            // Simple: if more opens than closes, indent
+            if opens > closes {
+                "    ".to_string()  // 4 spaces indent
             } else {
-                indent
+                String::new()  // No indent
             }
         } else {
             String::new()

@@ -417,9 +417,15 @@ impl Editor {
         file_path: Option<&Path>,
     ) -> Result<(), String> {
         let current_text = self.text();
+        let had_trailing_newline = current_text.ends_with('\n');
 
         match formatter.format_text(&current_text, file_path) {
-            Ok(formatted_text) => {
+            Ok(mut formatted_text) => {
+                // ✅ FIX: If original didn't have trailing newline but formatter added one, remove it
+                if !had_trailing_newline && formatted_text.ends_with('\n') {
+                    formatted_text.pop();
+                }
+                
                 if formatted_text != current_text {
                     self.replace_all(&formatted_text);
                 }

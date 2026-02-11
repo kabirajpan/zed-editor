@@ -29,8 +29,8 @@ impl History {
         self.current = Arc::new(new_buffer);
     }
 
-    pub fn push(&mut self, new_buffer: Buffer, transaction: Transaction) {
-        self.undo_stack.push((self.current.clone(), transaction));
+    pub fn push(&mut self, old_buffer: Buffer, new_buffer: Buffer, transaction: Transaction) {
+        self.undo_stack.push((Arc::new(old_buffer), transaction));
         self.current = Arc::new(new_buffer);
         self.redo_stack.clear();
     }
@@ -63,5 +63,20 @@ impl History {
 
     pub fn can_redo(&self) -> bool {
         !self.redo_stack.is_empty()
+    }
+
+    /// Get the last transaction on the undo stack (for grouping consecutive edits)
+    pub fn last_transaction(&self) -> Option<&Transaction> {
+        self.undo_stack.last().map(|(_, txn)| txn)
+    }
+
+    /// Check if undo stack is empty
+    pub fn is_empty(&self) -> bool {
+        self.undo_stack.is_empty()
+    }
+
+    /// Get mutable reference to last transaction for merging consecutive edits
+    pub fn last_transaction_mut(&mut self) -> Option<&mut Transaction> {
+        self.undo_stack.last_mut().map(|(_, txn)| txn)
     }
 }

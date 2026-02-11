@@ -18,6 +18,7 @@ pub struct GuiApp {
     editor: Editor,
     cursor_blink: bool,
     last_blink: Instant,
+    last_input_time: Instant,  // ✅ Track when user last typed
     status_message: String,
     auto_scroll: bool,
     current_file: Option<PathBuf>,
@@ -39,6 +40,7 @@ impl GuiApp {
             editor: Editor::new(),
             cursor_blink: true,
             last_blink: Instant::now(),
+            last_input_time: Instant::now(),
             status_message: String::new(),
             auto_scroll: true,
             current_file: None,
@@ -72,6 +74,8 @@ impl GuiApp {
 
         self.status_message.clear();
         self.auto_scroll = true;
+        self.last_input_time = Instant::now();  // ✅ Reset input time on typing
+        self.cursor_blink = true;  // ✅ Show cursor when typing
         self.renderer.invalidate_from_line(cursor_line);
     }
 
@@ -299,9 +303,15 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.last_blink.elapsed().as_millis() > 500 {
+        // ✅ Only blink cursor if user hasn't typed for 500ms (cursor pauses after typing)
+        let is_typing = self.last_input_time.elapsed().as_millis() < 500;
+        
+        if !is_typing && self.last_blink.elapsed().as_millis() > 500 {
             self.cursor_blink = !self.cursor_blink;
             self.last_blink = Instant::now();
+        } else if is_typing {
+            // ✅ Keep cursor visible while typing
+            self.cursor_blink = true;
         }
         ctx.request_repaint();
 

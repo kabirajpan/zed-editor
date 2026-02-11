@@ -111,19 +111,46 @@ impl Editor {
         self.pending_start_cursor = None;
     }
 
-    /// ✅ FIX: Insert with intelligent batching (word-by-word + time-based undo)
+    /// ✅ SIMPLE WORD-BY-WORD: Only batch non-whitespace characters
+    /// Whitespace (spaces, tabs, newlines) are applied directly without batching
     pub fn insert(&mut self, text: &str) {
         let cursor_before = self.cursor();
+        let is_whitespace = text.chars().all(|c| c.is_whitespace());
 
-        // ✅ CRITICAL: Flush pending batch on space/newline OR after 1 second of inactivity
-        let is_word_boundary = text == " " || text == "\n";
-        let time_based_flush = self.last_edit_time.elapsed().as_millis() > 1000;
-        
-        // Flush old batch only on timeout, NOT on word boundary (we want space/newline in the batch)
-        if time_based_flush && !is_word_boundary && !self.pending_insert.is_empty() {
+        // If it's whitespace, flush pending word and insert directly (no batching for whitespace)
+        if is_whitespace {
             self.flush_pending_insert();
+            
+            let offset = self.buffer().point_to_offset(cursor_before);
+            
+            // Handle auto-indent for newlines
+            let text_to_insert = if text == "\n" {
+                let rope = self.buffer().rope();
+                let indent = self.indent_calculator.calculate_indent_with_rope(
+                    rope,
+                    cursor_before.row,
+                    self.file_path.as_deref(),
+                );
+                format!("\n{}", indent)
+            } else {
+                text.to_string()
+            };
+
+            let mut new_buffer = self.buffer().clone();
+            new_buffer.insert(offset, &text_to_insert);
+
+            let new_offset = offset.value() + text_to_insert.len();
+            let cursor_after = new_buffer.offset_to_point(Offset(new_offset));
+
+            self.history.update_current(new_buffer);
+            self.set_cursor(cursor_after);
+            self.version += 1;
+            self.last_edit_time = Instant::now();
+            return;  // Don't batch whitespace
         }
 
+        // Non-whitespace: add to pending word batch
+        
         // Start new pending batch if needed and save the buffer state BEFORE editing
         if self.pending_start_cursor.is_none() {
             self.pending_start_cursor = Some(cursor_before);
@@ -131,41 +158,19 @@ impl Editor {
         }
 
         let offset = self.buffer().point_to_offset(cursor_before);
-
-        // Handle auto-indent for newlines
-        let text_to_insert = if text == "\n" {
-            let rope = self.buffer().rope();
-            let indent = self.indent_calculator.calculate_indent_with_rope(
-                rope,
-                cursor_before.row,
-                self.file_path.as_deref(),
-            );
-            format!("\n{}", indent)
-        } else {
-            text.to_string()
-        };
-
-        // Apply edit directly
         let mut new_buffer = self.buffer().clone();
-        new_buffer.insert(offset, &text_to_insert);
+        new_buffer.insert(offset, text);
 
-        // Move cursor
-        let new_offset = offset.value() + text_to_insert.len();
+        let new_offset = offset.value() + text.len();
         let cursor_after = new_buffer.offset_to_point(Offset(new_offset));
 
-        // Update current buffer directly
         self.history.update_current(new_buffer);
         self.set_cursor(cursor_after);
         self.version += 1;
         self.last_edit_time = Instant::now();
 
-        // Add to pending batch (includes space/newline as part of the batch)
-        self.pending_insert.push_str(&text_to_insert);
-
-        // Flush AFTER adding the space/newline so they're part of the same batch
-        if is_word_boundary {
-            self.flush_pending_insert();
-        }
+        // Add to pending batch (only non-whitespace)
+        self.pending_insert.push_str(text);
     }
 
     /// Backspace with immediate history save
@@ -231,31 +236,24 @@ impl Editor {
         }
     }
 
-    /// ✅ Undo - properly handles pending insert without double-click
+    /// ✅ Undo - properly handles pending text
     pub fn undo(&mut self) {
-        // Check if we have a pending insert
-        let had_pending = !self.pending_insert.is_empty();
-        
-        // Clear pending state
-        self.pending_insert.clear();
-        self.pending_start_cursor = None;
-        self.pending_start_buffer = None;
-        
-        // Flush would have already been called if needed, but clear it anyway
-        
-        // Now undo twice if we had a pending insert (once for the flush, once for the real action)
-        // But if history is empty after the flush, just undo once
-        if had_pending && self.history.can_undo() {
-            // We just added pending to history, pop it
-            let _ = self.history.undo();
-            
-            // Now pop the REAL previous action
-            if let Some(transaction) = self.history.undo() {
-                self.set_cursor(transaction.cursor_before);
-                self.version += 1;
+        // Check if we have pending text (incomplete word without space)
+        if !self.pending_insert.is_empty() {
+            // ✅ FIX: If user has pending text, discard it (don't flush it)
+            // Restore buffer to state BEFORE pending text started
+            if let Some(before_buffer) = self.pending_start_buffer.take() {
+                self.history.update_current((*before_buffer).clone());
+                // Move cursor back to where pending text started
+                if let Some(start_cursor) = self.pending_start_cursor {
+                    self.set_cursor(start_cursor);
+                }
             }
-        } else if !had_pending {
-            // No pending, just normal undo
+            self.pending_insert.clear();
+            self.pending_start_cursor = None;
+            self.version += 1;
+        } else {
+            // No pending text - normal undo: pop from history
             if let Some(transaction) = self.history.undo() {
                 self.set_cursor(transaction.cursor_before);
                 self.version += 1;

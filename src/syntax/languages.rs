@@ -6,7 +6,7 @@ use tree_sitter_javascript::language as tree_sitter_javascript_lang;
 use tree_sitter_python::language as tree_sitter_python_lang;
 use tree_sitter_rust::language as tree_sitter_rust_lang;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LanguageId {
     Rust,
     JavaScript,

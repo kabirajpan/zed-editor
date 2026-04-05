@@ -1,8 +1,10 @@
-use crate::syntax::languages::{LanguageConfig, LanguageRegistry};
+use crate::syntax::languages::{LanguageConfig, LanguageId, LanguageRegistry};
 use crate::syntax::theme::SyntaxTheme;
 use egui::Color32;
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::path::Path;
-use tree_sitter::{Query, QueryCursor, Tree};
+use tree_sitter::{InputEdit, Parser, Point as TsPoint, Query, QueryCursor, Tree};
 
 #[derive(Debug, Clone)]
 pub struct HighlightSpan {
@@ -11,17 +13,21 @@ pub struct HighlightSpan {
     pub color: Color32,
 }
 
-struct ParseCache {
-    text_hash: u64,
+struct ParseState {
     tree: Tree,
-    language_name: String,
+    language_id: LanguageId,
+    /// Always stored WITH a trailing '\n' to match what highlight_viewport
+    /// feeds to the parser.  notify_edit must uphold this invariant.
+    text: String,
 }
 
 pub struct SyntaxHighlighter {
     registry: LanguageRegistry,
     theme: SyntaxTheme,
-    logged_once: bool,
-    parse_cache: Option<ParseCache>,
+    parser: Parser,
+    query_cache: HashMap<LanguageId, Query>,
+    parse_state: Option<ParseState>,
+    highlight_cache: Option<(u64, HashMap<usize, Vec<(usize, usize, Color32)>>)>,
 }
 
 impl SyntaxHighlighter {
@@ -29,222 +35,264 @@ impl SyntaxHighlighter {
         Self {
             registry: LanguageRegistry::new(),
             theme,
-            logged_once: false,
-            parse_cache: None,
+            parser: Parser::new(),
+            query_cache: HashMap::new(),
+            parse_state: None,
+            highlight_cache: None,
         }
     }
 
-    // Simple hash function for text
-    fn hash_text(text: &str) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
-        hasher.finish()
+    /// Invalidate the highlight cache (line-level cache miss next frame).
+    pub fn invalidate(&mut self) {
+        self.highlight_cache = None;
     }
 
-    /// 🚀 PRODUCTION-FIXED: Highlight line using Rope directly (no full file conversion!)
-    /// This is the main entry point called by viewport_renderer
-    pub fn highlight_line(
+    /// Full reset: discard the cached parse tree so the next highlight pass
+    /// does a clean full parse.  Use this after undo/redo/load/format — any
+    /// operation that jumps the buffer to an arbitrary prior state.
+    pub fn reset(&mut self) {
+        self.highlight_cache = None;
+        self.parse_state = None;
+    }
+
+    /// Call this after every incremental rope edit so tree-sitter can reparse
+    /// incrementally rather than from scratch.
+    ///
+    /// `rope` must be the **post-edit** rope.
+    /// `start_byte`, `old_end_byte`, `new_end_byte` are byte offsets in the
+    /// rope (without any appended newline).
+    pub fn notify_edit(
         &mut self,
         rope: &crate::rope::Rope,
-        line_number: usize,
-        file_path: Option<&Path>,
-    ) -> Vec<HighlightSpan> {
-        // Only log ONCE per actual file (not when no file is open)
-        let should_log = !self.logged_once && line_number == 0 && file_path.is_some();
+        start_byte: usize,
+        old_end_byte: usize,
+        new_end_byte: usize,
+    ) {
+        self.highlight_cache = None;
 
-        if should_log {
-            eprintln!("\n=== HIGHLIGHT DEBUG ===");
-            eprintln!("File path: {:?}", file_path);
-            eprintln!("Rope length: {} bytes", rope.len());
-        }
-
-        let Some(path) = file_path else {
-            return vec![];
+        let parse_state = match self.parse_state.as_mut() {
+            Some(s) => s,
+            None => return,
         };
 
-        let Some(lang_config) = self.registry.detect_language(path) else {
-            if should_log {
-                eprintln!("ERROR: Language not detected for {:?}", path);
-                self.logged_once = true;
-            }
-            return vec![];
+        // parse_state.text is always stored with a trailing '\n'.
+        // Use it directly for the old positions.
+        let start_pos = byte_to_point(&parse_state.text, start_byte);
+        let old_end_pos = byte_to_point(&parse_state.text, old_end_byte);
+
+        // Build the new text WITH trailing '\n' to match highlight_viewport.
+        let new_text = rope_to_text_with_newline(rope);
+        let new_end_pos = byte_to_point(&new_text, new_end_byte);
+
+        let edit = InputEdit {
+            start_byte,
+            old_end_byte,
+            new_end_byte,
+            start_position: start_pos,
+            old_end_position: old_end_pos,
+            new_end_position: new_end_pos,
         };
 
-        // Clone the config to avoid borrow issues
-        let lang_config = lang_config.clone();
-
-        if should_log {
-            eprintln!("Language detected: {}", lang_config.name);
-        }
-
-        let highlights =
-            self.highlight_line_with_language(rope, line_number, &lang_config, should_log);
-
-        if should_log {
-            eprintln!("Highlights generated: {}", highlights.len());
-            eprintln!("======================\n");
-            self.logged_once = true;
-        }
-
-        highlights
+        parse_state.tree.edit(&edit);
+        // Keep parse_state.text in sync (with trailing '\n').
+        parse_state.text = new_text;
     }
 
-    /// 🚀 PRODUCTION-FIXED: Core highlighting logic using context window
-    /// Instead of parsing the entire file, we parse a small context window around the target line
-    fn highlight_line_with_language(
-        &mut self,
-        rope: &crate::rope::Rope,
-        line_number: usize,
-        config: &LanguageConfig,
-        should_log: bool,
-    ) -> Vec<HighlightSpan> {
-        // 🚀 CRITICAL FIX: Get line byte range using Rope's efficient O(log n) lookup
-        // OLD CODE: Iterated through entire file character by character (O(n))
-        // NEW CODE: Uses rope's cached newline positions (O(log n))
-        let Some((line_start_byte, line_end_byte)) = rope.line_byte_range(line_number) else {
-            return vec![];
-        };
-
-        // For syntax highlighting, we need context around the line
-        // Get a reasonable context window (e.g., 50 lines before and after)
-        const CONTEXT_LINES: usize = 50;
-
-        let context_start_line = line_number.saturating_sub(CONTEXT_LINES);
-        let context_end_line = (line_number + CONTEXT_LINES + 1).min(rope.line_count());
-
-        let context_start_byte = rope.line_to_byte(context_start_line);
-        let context_end_byte = if context_end_line < rope.line_count() {
-            rope.line_to_byte(context_end_line)
-        } else {
-            rope.len()
-        };
-
-        // 🚀 CRITICAL FIX: Extract ONLY the context window, not the entire file!
-        // OLD CODE: let full_text = editor.text(); // Converted entire rope to string!
-        // NEW CODE: Only extract ~100 lines of context
-        let context_text = rope.slice_bytes(context_start_byte, context_end_byte);
-
-        if should_log {
-            eprintln!(
-                "[CONTEXT] Line {}: extracting {} bytes (lines {}-{})",
-                line_number,
-                context_text.len(),
-                context_start_line,
-                context_end_line
-            );
+    fn ensure_query_compiled(&mut self, config: &LanguageConfig) -> bool {
+        if self.query_cache.contains_key(&config.id) {
+            return true;
         }
-
-        // Parse only the context window (not the entire file!)
-        let mut parser = self.registry.create_parser(config);
-        let tree = match parser.parse(&context_text, None) {
-            Some(t) => t,
-            None => {
-                if should_log {
-                    eprintln!("[PARSE] ERROR: Parse failed!");
-                }
-                return vec![];
-            }
-        };
-
-        if should_log {
-            eprintln!("[PARSE] Context parsed successfully");
-        }
-
-        let query = match Query::new(&config.language, config.highlight_query) {
+        match Query::new(&config.language, config.highlight_query) {
             Ok(q) => {
-                if should_log {
-                    eprintln!("[QUERY] Success! {} patterns", q.pattern_count());
-                }
-                q
+                self.query_cache.insert(config.id, q);
+                true
             }
             Err(e) => {
-                if should_log {
-                    eprintln!("[QUERY] ERROR: {}", e);
-                }
-                return vec![];
+                eprintln!("[SyntaxHighlighter] Query error for {}: {}", config.name, e);
+                false
+            }
+        }
+    }
+
+    pub fn highlight_viewport(
+        &mut self,
+        rope: &crate::rope::Rope,
+        version: u64,
+        file_path: Option<&Path>,
+        visible_start: usize,
+        visible_end: usize,
+    ) -> HashMap<usize, Vec<(usize, usize, Color32)>> {
+        let path = match file_path {
+            Some(p) => p,
+            None => return HashMap::new(),
+        };
+
+        let lang_config = match self.registry.detect_language(path) {
+            Some(c) => c.clone(),
+            None => return HashMap::new(),
+        };
+
+        // Return cached highlights if version unchanged.
+        if let Some((cached_version, ref cached_lines)) = self.highlight_cache {
+            if cached_version == version {
+                return (visible_start..visible_end)
+                    .filter_map(|line| cached_lines.get(&line).map(|s| (line, s.clone())))
+                    .collect();
+            }
+        }
+
+        let need_lang_change = self
+            .parse_state
+            .as_ref()
+            .map(|s| s.language_id != lang_config.id)
+            .unwrap_or(true);
+
+        if need_lang_change {
+            if let Err(e) = self.parser.set_language(&lang_config.language) {
+                eprintln!("[SyntaxHighlighter] Failed to set language: {}", e);
+                return HashMap::new();
+            }
+            self.parse_state = None;
+        }
+
+        // Always parse with a trailing '\n' so tree-sitter predicates can't
+        // read past the last byte, and so parse_state.text stays consistent
+        // with what notify_edit stores.
+        let full_text = rope_to_text_with_newline(rope);
+
+        let old_tree = self.parse_state.as_ref().map(|s| &s.tree);
+
+        let tree = match self.parser.parse(&full_text, old_tree) {
+            Some(t) => t,
+            None => {
+                eprintln!("[SyntaxHighlighter] Parse failed");
+                return HashMap::new();
             }
         };
 
+        self.parse_state = Some(ParseState {
+            tree: tree.clone(),
+            language_id: lang_config.id,
+            text: full_text.clone(),
+        });
+
+        if !self.ensure_query_compiled(&lang_config) {
+            return HashMap::new();
+        }
+
+        let query = self.query_cache.get(&lang_config.id).unwrap();
+        let capture_names: Vec<String> = query
+            .capture_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let color_map: Vec<Color32> = capture_names
+            .iter()
+            .map(|name| self.theme.get_color(name))
+            .collect();
+
+        let mut all_lines: HashMap<usize, Vec<(usize, usize, Color32)>> = HashMap::new();
         let mut cursor = QueryCursor::new();
         let root_node = tree.root_node();
 
-        // Calculate offsets relative to context window
-        let target_line_start_in_context = line_start_byte - context_start_byte;
-        let target_line_end_in_context = line_end_byte - context_start_byte;
-
-        let line_text = rope.slice_bytes(line_start_byte, line_end_byte);
-        let line_char_len = line_text.chars().count();
-
-        let mut highlights = Vec::new();
-
-        // Query for highlights in the context window
-        for match_ in cursor.matches(&query, root_node, context_text.as_bytes()) {
+        for match_ in cursor.matches(query, root_node, full_text.as_bytes()) {
             for capture in match_.captures {
                 let node = capture.node;
-                let start = node.start_byte();
-                let end = node.end_byte();
+                let node_start = node.start_position();
+                let node_end = node.end_position();
+                let color = color_map[capture.index as usize];
 
-                // Check if this capture overlaps with our target line
-                if end > target_line_start_in_context && start < target_line_end_in_context {
-                    let capture_name = &query.capture_names()[capture.index as usize];
-                    let color = self.theme.get_color(capture_name);
+                for row in node_start.row..=node_end.row {
+                    let line_str = match rope.line(row) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let line_char_len = line_str.chars().count();
+                    let line_byte_len = line_str.len();
 
-                    // Convert byte offsets to character offsets within the line
-                    let span_start = if start <= target_line_start_in_context {
+                    let col_start = if row == node_start.row {
+                        safe_char_count(&line_str, node_start.column.min(line_byte_len))
+                    } else {
                         0
-                    } else {
-                        context_text[target_line_start_in_context..start]
-                            .chars()
-                            .count()
                     };
 
-                    let span_end = if end >= target_line_end_in_context {
+                    let col_end = if row == node_end.row {
+                        safe_char_count(&line_str, node_end.column.min(line_byte_len))
+                    } else {
                         line_char_len
-                    } else {
-                        context_text[target_line_start_in_context..end]
-                            .chars()
-                            .count()
                     };
 
-                    if span_end > span_start {
-                        highlights.push(HighlightSpan {
-                            start: span_start,
-                            end: span_end,
-                            color,
-                        });
+                    if col_end > col_start {
+                        all_lines
+                            .entry(row)
+                            .or_default()
+                            .push((col_start, col_end, color));
                     }
                 }
             }
         }
 
-        // Sort by start position, then by longest span first (for proper nesting)
-        highlights.sort_by_key(|h| (h.start, std::cmp::Reverse(h.end)));
-
-        // Merge overlapping highlights
-        let mut merged = Vec::new();
-        for highlight in highlights {
-            if merged.is_empty() {
-                merged.push(highlight);
-            } else {
-                let last = merged.last_mut().unwrap();
-                if highlight.start < last.end {
-                    // Overlapping - extend if needed
-                    if highlight.end > last.end {
-                        last.end = highlight.end;
+        // Sort and deduplicate per line.
+        for spans in all_lines.values_mut() {
+            spans.sort_by_key(|&(start, end, _)| (start, Reverse(end)));
+            let mut merged: Vec<(usize, usize, Color32)> = Vec::new();
+            for span in spans.drain(..) {
+                if let Some(last) = merged.last() {
+                    if span.0 < last.1 {
+                        continue;
                     }
-                } else {
-                    // No overlap - add new span
-                    merged.push(highlight);
                 }
+                merged.push(span);
             }
+            *spans = merged;
         }
 
-        merged
+        self.highlight_cache = Some((version, all_lines.clone()));
+
+        (visible_start..visible_end)
+            .filter_map(|line| all_lines.remove(&line).map(|s| (line, s)))
+            .collect()
     }
 
     pub fn set_theme(&mut self, theme: SyntaxTheme) {
         self.theme = theme;
+        self.highlight_cache = None;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Build the canonical text string fed to tree-sitter: rope content + '\n'.
+/// Both highlight_viewport and notify_edit must use this so byte offsets are
+/// always consistent with what is stored in parse_state.text.
+fn rope_to_text_with_newline(rope: &crate::rope::Rope) -> String {
+    let mut t = rope.to_string();
+    if !t.ends_with('\n') {
+        t.push('\n');
+    }
+    t
+}
+
+/// Convert byte offset to tree-sitter Point.
+fn byte_to_point(text: &str, byte_offset: usize) -> TsPoint {
+    let byte_offset = byte_offset.min(text.len());
+    let before = &text[..byte_offset];
+    let row = before.chars().filter(|&c| c == '\n').count();
+    let col = before
+        .rfind('\n')
+        .map(|i| byte_offset - i - 1)
+        .unwrap_or(byte_offset);
+    TsPoint { row, column: col }
+}
+
+/// Safely count chars up to a byte offset, clamping to char boundary.
+fn safe_char_count(s: &str, byte_offset: usize) -> usize {
+    let clamped = (0..=byte_offset.min(s.len()))
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0);
+    s[..clamped].chars().count()
 }

@@ -23,16 +23,26 @@ impl History {
         &self.current
     }
 
-    /// 🚀 NEW: Update current buffer without saving to undo stack
-    /// Used for batched edits - we update the buffer live, then save to history later
+    /// Update current buffer without saving to undo stack.
+    /// Used for live batched edits — we update the buffer incrementally,
+    /// then commit the whole batch to history via push() when the word is done.
     pub fn update_current(&mut self, new_buffer: Buffer) {
         self.current = Arc::new(new_buffer);
     }
 
+    /// Commit a completed edit to the undo stack.
+    /// Clears the redo stack — any new edit breaks the redo chain.
     pub fn push(&mut self, old_buffer: Buffer, new_buffer: Buffer, transaction: Transaction) {
         self.undo_stack.push((Arc::new(old_buffer), transaction));
         self.current = Arc::new(new_buffer);
         self.redo_stack.clear();
+    }
+
+    /// Manually push a state onto the redo stack.
+    /// Used when undoing a pending (un-committed) insert, so redo can
+    /// bring it back correctly.
+    pub fn push_redo(&mut self, buffer: Arc<Buffer>, transaction: Transaction) {
+        self.redo_stack.push((buffer, transaction));
     }
 
     pub fn undo(&mut self) -> Option<Transaction> {
@@ -65,18 +75,20 @@ impl History {
         !self.redo_stack.is_empty()
     }
 
-    /// Get the last transaction on the undo stack (for grouping consecutive edits)
     pub fn last_transaction(&self) -> Option<&Transaction> {
         self.undo_stack.last().map(|(_, txn)| txn)
     }
 
-    /// Check if undo stack is empty
     pub fn is_empty(&self) -> bool {
         self.undo_stack.is_empty()
     }
 
-    /// Get mutable reference to last transaction for merging consecutive edits
     pub fn last_transaction_mut(&mut self) -> Option<&mut Transaction> {
         self.undo_stack.last_mut().map(|(_, txn)| txn)
+    }
+
+    /// Expose current Arc<Buffer> so editor can push it to redo stack directly.
+    pub fn current_arc(&self) -> Arc<Buffer> {
+        self.current.clone()
     }
 }

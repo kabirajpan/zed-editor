@@ -1,9 +1,10 @@
 use crate::formatter::providers::{PrettierProvider, RustfmtProvider};
-use crate::io::write_file_from_rope; // 🚀 Import new efficient rope writer
+use crate::io::write_file_from_rope;
 use crate::{read_file, Editor, Formatter, SyntaxHighlighter, SyntaxTheme};
 use std::path::PathBuf;
 use std::time::Instant;
 
+use super::focus::{ActivePanels, FocusManager, FocusTarget};
 use super::viewport_renderer::ViewportRenderer;
 
 #[derive(Clone, Debug)]
@@ -18,7 +19,7 @@ pub struct GuiApp {
     editor: Editor,
     cursor_blink: bool,
     last_blink: Instant,
-    last_input_time: Instant,  // ✅ Track when user last typed
+    last_input_time: Instant,
     status_message: String,
     auto_scroll: bool,
     current_file: Option<PathBuf>,
@@ -26,6 +27,9 @@ pub struct GuiApp {
     renderer: ViewportRenderer,
     formatter: Formatter,
     highlighter: SyntaxHighlighter,
+
+    focus: FocusManager,
+    active_panels: ActivePanels,
 }
 
 impl GuiApp {
@@ -48,13 +52,18 @@ impl GuiApp {
             renderer: ViewportRenderer::new(),
             formatter,
             highlighter,
+            focus: FocusManager::new(),
+            active_panels: ActivePanels::default(),
         }
     }
 
     fn handle_text_input(&mut self, text: &str) {
+        if !self.focus.is_focused(FocusTarget::Editor) {
+            return;
+        }
+
         let cursor_line = self.editor.cursor().row;
 
-        // Auto-close brackets
         let auto_close = match text {
             "{" => Some("}"),
             "[" => Some("]"),
@@ -74,12 +83,32 @@ impl GuiApp {
 
         self.status_message.clear();
         self.auto_scroll = true;
-        self.last_input_time = Instant::now();  // ✅ Reset input time on typing
-        self.cursor_blink = true;  // ✅ Show cursor when typing
+        self.last_input_time = Instant::now();
+        self.cursor_blink = true;
         self.renderer.invalidate_from_line(cursor_line);
     }
 
     fn handle_key(&mut self, key: egui::Key, modifiers: egui::Modifiers) {
+        if key == egui::Key::Tab {
+            let consumed = self.focus.handle_tab(modifiers.shift, &self.active_panels);
+
+            if !consumed && self.focus.is_focused(FocusTarget::Editor) {
+                let cursor_line = self.editor.cursor().row;
+                self.editor.insert("    ");
+                self.status_message.clear();
+                self.auto_scroll = true;
+                self.last_input_time = Instant::now();
+                self.cursor_blink = true;
+                self.renderer.invalidate_from_line(cursor_line);
+            }
+            return;
+        }
+
+        if !self.focus.is_focused(FocusTarget::Editor) {
+            return;
+        }
+
+        self.focus.on_key_pressed();
         let cursor_before = self.editor.cursor();
 
         match key {
@@ -124,14 +153,16 @@ impl GuiApp {
                 if self.editor.can_undo() {
                     self.editor.undo();
                     self.status_message = "Undo".to_string();
-                    self.renderer.invalidate_from_line(0);
+                    // Undo jumps to an arbitrary prior buffer state — full reset.
+                    self.renderer.full_reset();
                 }
             }
             egui::Key::Y if modifiers.ctrl => {
                 if self.editor.can_redo() {
                     self.editor.redo();
                     self.status_message = "Redo".to_string();
-                    self.renderer.invalidate_from_line(0);
+                    // Same as undo.
+                    self.renderer.full_reset();
                 }
             }
             egui::Key::S if modifiers.ctrl => {
@@ -157,7 +188,8 @@ impl GuiApp {
             match self.editor.format(&self.formatter, Some(file_path)) {
                 Ok(_) => {
                     self.status_message = "✨ Code formatted successfully".to_string();
-                    self.renderer.invalidate_from_line(0);
+                    // replace_all was called inside format — full reset.
+                    self.renderer.full_reset();
                 }
                 Err(e) => {
                     self.status_message = format!("⚠️ Format failed: {}", e);
@@ -183,7 +215,6 @@ impl GuiApp {
                 Ok(metadata) => {
                     let file_size = metadata.len();
                     const MAX_SIZE: u64 = 100_000_000;
-
                     if file_size > MAX_SIZE {
                         self.status_message = format!(
                             "⚠️ File too large: {:.2} MB (max: 100 MB)",
@@ -191,7 +222,6 @@ impl GuiApp {
                         );
                         return;
                     }
-
                     self.load_file_simple(&path, file_size);
                 }
                 Err(e) => {
@@ -208,7 +238,8 @@ impl GuiApp {
                 self.editor = Editor::from_text(&contents);
                 self.editor.set_file_path(Some(path.clone()));
                 self.current_file = Some(path.clone());
-                self.renderer.invalidate_from_line(0);
+                // Entirely new document — full reset.
+                self.renderer.full_reset();
 
                 let filename = path
                     .file_name()
@@ -227,24 +258,18 @@ impl GuiApp {
         }
     }
 
-    /// 🚀 PERFORMANCE-FIXED: Save file using Rope directly (no string conversion!)
     fn save_file(&mut self) {
         if let Some(ref path) = self.current_file.clone() {
-            // Format if formatter is available
             if self.formatter.find_provider(&path).is_some() {
                 match self.editor.format(&self.formatter, Some(&path)) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        self.renderer.full_reset();
+                    }
                     Err(e) => {
                         self.status_message = format!("⚠️ Format failed: {}, saving anyway", e);
                     }
                 }
             }
-
-            // 🚀 CRITICAL FIX: Write directly from Rope without converting to String!
-            // OLD CODE:
-            // match crate::write_file(&path, &self.editor.text()) {  // ❌ Converts entire file!
-
-            // NEW CODE: Use efficient rope writer
             match write_file_from_rope(&path, self.editor.buffer().rope()) {
                 Ok(_) => {
                     let filename = path
@@ -252,7 +277,6 @@ impl GuiApp {
                         .and_then(|n| n.to_str())
                         .unwrap_or("Unknown");
                     self.status_message = format!("💾 Saved: {}", filename);
-                    self.renderer.invalidate_from_line(0);
                 }
                 Err(e) => {
                     self.status_message = format!("❌ Error: {}", e);
@@ -263,7 +287,6 @@ impl GuiApp {
         }
     }
 
-    /// 🚀 PERFORMANCE-FIXED: Save as using Rope directly
     fn save_file_as(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Text Files", &["txt"])
@@ -273,9 +296,6 @@ impl GuiApp {
             .add_filter("All Files", &["*"])
             .save_file()
         {
-            // 🚀 CRITICAL FIX: Write directly from Rope
-            // OLD CODE: match crate::write_file(&path, &self.editor.text()) {
-            // NEW CODE:
             match write_file_from_rope(&path, self.editor.buffer().rope()) {
                 Ok(_) => {
                     self.current_file = Some(path.clone());
@@ -296,24 +316,54 @@ impl GuiApp {
     fn new_file(&mut self) {
         self.editor = Editor::new();
         self.current_file = None;
-        self.renderer.invalidate_from_line(0);
+        self.renderer.full_reset();
         self.status_message = "📄 New file".to_string();
     }
 }
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ✅ Only blink cursor if user hasn't typed for 800ms (500ms grace + 300ms delay before blink)
         let is_typing = self.last_input_time.elapsed().as_millis() < 800;
-        
         if !is_typing && self.last_blink.elapsed().as_millis() > 500 {
             self.cursor_blink = !self.cursor_blink;
             self.last_blink = Instant::now();
         } else if is_typing {
-            // ✅ Keep cursor visible while typing
             self.cursor_blink = true;
         }
         ctx.request_repaint();
+
+        // ── Drain edit events and forward to the highlighter ──────────────────
+        // Must happen before rendering so tree-sitter's parse tree is up to
+        // date with the current rope before highlight_viewport is called.
+        {
+            let events = self.editor.drain_edit_events();
+            for e in events {
+                self.renderer.notify_edit(
+                    self.editor.buffer().rope(),
+                    e.start_byte,
+                    e.old_end_byte,
+                    e.new_end_byte,
+                );
+            }
+        }
+
+        // ── Input handling ────────────────────────────────────────────────────
+        let mut tab_pressed = false;
+        let mut shift_tab_pressed = false;
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+                tab_pressed = true;
+            }
+            if i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab) {
+                shift_tab_pressed = true;
+            }
+        });
+        if tab_pressed {
+            self.handle_key(egui::Key::Tab, egui::Modifiers::NONE);
+        }
+        if shift_tab_pressed {
+            self.handle_key(egui::Key::Tab, egui::Modifiers::SHIFT);
+        }
 
         ctx.input(|i| {
             for event in &i.events {
@@ -327,13 +377,16 @@ impl eframe::App for GuiApp {
                         modifiers,
                         ..
                     } => {
-                        self.handle_key(*key, *modifiers);
+                        if *key != egui::Key::Tab {
+                            self.handle_key(*key, *modifiers);
+                        }
                     }
                     _ => {}
                 }
             }
         });
 
+        // ── Top menu bar ──────────────────────────────────────────────────────
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -361,7 +414,7 @@ impl eframe::App for GuiApp {
                         .clicked()
                     {
                         self.editor.undo();
-                        self.renderer.invalidate_from_line(0);
+                        self.renderer.full_reset();
                         ui.close_menu();
                     }
                     if ui
@@ -369,16 +422,13 @@ impl eframe::App for GuiApp {
                         .clicked()
                     {
                         self.editor.redo();
-                        self.renderer.invalidate_from_line(0);
+                        self.renderer.full_reset();
                         ui.close_menu();
                     }
-
                     ui.separator();
-
-                    let can_format = self.current_file.is_some();
                     if ui
                         .add_enabled(
-                            can_format,
+                            self.current_file.is_some(),
                             egui::Button::new("✨ Format Code (Ctrl+Shift+F)"),
                         )
                         .clicked()
@@ -399,6 +449,7 @@ impl eframe::App for GuiApp {
             });
         });
 
+        // ── Status bar ────────────────────────────────────────────────────────
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             let cursor = self.editor.cursor();
             let status = if !self.status_message.is_empty() {
@@ -411,10 +462,25 @@ impl eframe::App for GuiApp {
                     self.editor.line_count()
                 )
             };
-            ui.label(status);
+            ui.horizontal(|ui| {
+                ui.label(status);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(self.focus.status_label())
+                            .color(egui::Color32::from_rgb(100, 160, 255))
+                            .small(),
+                    );
+                });
+            });
         });
 
+        // ── Editor (central panel) ────────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
+            if ui.rect_contains_pointer(ui.max_rect()) && ctx.input(|i| i.pointer.primary_clicked())
+            {
+                self.focus.set(FocusTarget::Editor);
+            }
+
             self.renderer.render_with_highlighting(
                 ui,
                 &self.editor,

@@ -5,8 +5,6 @@ use crate::syntax::IndentCalculator;
 use std::path::Path;
 use std::time::Instant;
 
-/// Byte-level record of a single rope edit, used to incrementally update the
-/// tree-sitter parse tree without keeping the highlighter in the Editor itself.
 #[derive(Debug, Clone)]
 pub struct EditEvent {
     pub start_byte: usize,
@@ -14,7 +12,6 @@ pub struct EditEvent {
     pub new_end_byte: usize,
 }
 
-/// Editor state - buffer + cursor + history
 #[derive(Clone)]
 pub struct Editor {
     history: History,
@@ -24,27 +21,17 @@ pub struct Editor {
     file_path: Option<std::path::PathBuf>,
 
     // ── Pending INSERT batch (word-level undo) ────────────────────────────────
-    // Non-whitespace characters accumulate here. When a space is typed, it is
-    // appended to pending_insert and then the whole "word " is committed as one
-    // undo unit. When any other boundary occurs (newline, backspace, cursor
-    // move, undo) the pending text is committed first.
     pending_insert: String,
     pending_start_cursor: Option<Point>,
     pending_start_buffer: Option<Box<Buffer>>,
 
     // ── Pending DELETE batch (word-level undo) ────────────────────────────────
-    // Consecutive backspace presses accumulate here. The batch is committed as
-    // one undo unit when the user stops deleting (starts typing, moves cursor,
-    // presses undo, etc.).
     pending_delete: String,
     pending_delete_cursor_before: Option<Point>,
     pending_delete_start_buffer: Option<Box<Buffer>>,
-    last_delete_time: Instant, // tracks pause between backspaces for time-based boundary
+    last_delete_time: Instant,
 
     last_edit_time: Instant,
-
-    // Tree-sitter sync: every rope mutation pushes one event here.
-    // The renderer drains this each frame and forwards to the highlighter.
     pending_edit_events: Vec<EditEvent>,
 }
 
@@ -111,48 +98,52 @@ impl Editor {
         self.selection
     }
 
+    pub fn set_selection(&mut self, selection: Selection) {
+        self.selection = selection;
+    }
+
     pub fn version(&self) -> u64 {
         self.version
     }
 
-    /// Drain all pending edit events. Call once per frame before highlighting.
     pub fn drain_edit_events(&mut self) -> Vec<EditEvent> {
         std::mem::take(&mut self.pending_edit_events)
     }
 
     // -------------------------------------------------------------------------
-    // Flush helpers — commit pending batches to the undo stack
+    // Word boundary
     // -------------------------------------------------------------------------
 
-    /// Commit the accumulated pending insert ("word " or "word") to undo stack.
+    fn is_word_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    // -------------------------------------------------------------------------
+    // Flush helpers
+    // -------------------------------------------------------------------------
+
     fn flush_pending_insert(&mut self) {
         if self.pending_insert.is_empty() {
             return;
         }
-
         if let Some(start_cursor) = self.pending_start_cursor.take() {
             let transaction =
                 Transaction::insert(self.pending_insert.clone(), start_cursor, self.cursor());
-
             let before_buffer = self
                 .pending_start_buffer
                 .take()
                 .map(|b| *b)
                 .unwrap_or_else(|| self.buffer().clone());
-
             self.history
                 .push(before_buffer, self.buffer().clone(), transaction);
         }
-
         self.pending_insert.clear();
     }
 
-    /// Commit the accumulated pending delete run to undo stack.
     fn flush_pending_delete(&mut self) {
         if self.pending_delete.is_empty() {
             return;
         }
-
         if let (Some(cursor_before), Some(before_buffer)) = (
             self.pending_delete_cursor_before.take(),
             self.pending_delete_start_buffer.take(),
@@ -163,24 +154,25 @@ impl Editor {
             self.history
                 .push(*before_buffer, self.buffer().clone(), transaction);
         }
-
         self.pending_delete.clear();
     }
 
     // -------------------------------------------------------------------------
-    // Editing operations
+    // Editing
     // -------------------------------------------------------------------------
 
     pub fn insert(&mut self, text: &str) {
-        // Any insert ends a backspace run.
-        self.flush_pending_delete();
+        // Selection → delete it first, then insert (replaces selected text)
+        if !self.selection.is_empty() {
+            self.delete_selection();
+        }
 
+        self.flush_pending_delete();
         let cursor_before = self.cursor();
 
-        // ── Newline: flush pending word, then commit newline as its own unit ──
+        // Newline: flush word, commit newline as own unit
         if text == "\n" {
             self.flush_pending_insert();
-
             let offset = self.buffer().point_to_offset(cursor_before);
             let rope = self.buffer().rope();
             let indent = self.indent_calculator.calculate_indent_with_rope(
@@ -189,143 +181,113 @@ impl Editor {
                 self.file_path.as_deref(),
             );
             let text_to_insert = format!("\n{}", indent);
-
             let old_buffer = self.buffer().clone();
             let mut new_buffer = old_buffer.clone();
             new_buffer.insert(offset, &text_to_insert);
-
             let new_offset = offset.value() + text_to_insert.len();
             let cursor_after = new_buffer.offset_to_point(Offset(new_offset));
-
             self.pending_edit_events.push(EditEvent {
                 start_byte: offset.value(),
                 old_end_byte: offset.value(),
                 new_end_byte: offset.value() + text_to_insert.len(),
             });
-
             let transaction = Transaction::insert(text_to_insert, cursor_before, cursor_after);
             self.history.push(old_buffer, new_buffer, transaction);
-
             self.set_cursor(cursor_after);
             self.version += 1;
             self.last_edit_time = Instant::now();
             return;
         }
 
-        // ── Space: append to pending word, then flush "word " as one unit ─────
+        // Space: append to pending word then flush "word " as one unit
         if text == " " {
-            // If nothing is pending yet this is a standalone space — still
-            // treat it as its own unit by starting a fresh pending batch.
             if self.pending_start_buffer.is_none() {
                 self.pending_start_cursor = Some(cursor_before);
                 self.pending_start_buffer = Some(Box::new(self.buffer().clone()));
             }
-
             let offset = self.buffer().point_to_offset(cursor_before);
             let mut new_buffer = self.buffer().clone();
             new_buffer.insert(offset, text);
-
             let new_offset = offset.value() + text.len();
             let cursor_after = new_buffer.offset_to_point(Offset(new_offset));
-
             self.pending_edit_events.push(EditEvent {
                 start_byte: offset.value(),
                 old_end_byte: offset.value(),
                 new_end_byte: offset.value() + text.len(),
             });
-
-            // Live-update the buffer so the user sees the space immediately.
             self.history.update_current(new_buffer);
             self.set_cursor(cursor_after);
             self.version += 1;
             self.last_edit_time = Instant::now();
-
-            // Append space to the pending text and flush — "word " is now one
-            // complete undo unit.
             self.pending_insert.push_str(text);
             self.flush_pending_insert();
             return;
         }
 
-        // ── Non-whitespace: accumulate into pending word ───────────────────────
+        // Non-whitespace: accumulate
         if self.pending_start_cursor.is_none() {
             self.pending_start_cursor = Some(cursor_before);
             self.pending_start_buffer = Some(Box::new(self.buffer().clone()));
         }
-
         let offset = self.buffer().point_to_offset(cursor_before);
         let mut new_buffer = self.buffer().clone();
         new_buffer.insert(offset, text);
-
         let new_offset = offset.value() + text.len();
         let cursor_after = new_buffer.offset_to_point(Offset(new_offset));
-
         self.pending_edit_events.push(EditEvent {
             start_byte: offset.value(),
             old_end_byte: offset.value(),
             new_end_byte: offset.value() + text.len(),
         });
-
         self.history.update_current(new_buffer);
         self.set_cursor(cursor_after);
         self.version += 1;
         self.last_edit_time = Instant::now();
-
         self.pending_insert.push_str(text);
     }
 
     pub fn backspace(&mut self) {
-        // Any delete ends a word insert batch.
+        if !self.selection.is_empty() {
+            self.delete_selection();
+            return;
+        }
         self.flush_pending_insert();
-
         let cursor = self.cursor();
         if cursor.row == 0 && cursor.column == 0 {
             return;
         }
-
         let cursor_offset = self.buffer().point_to_offset(cursor);
         if cursor_offset.value() == 0 {
             return;
         }
-
         let start = Offset(cursor_offset.value() - 1);
         let deleted_char = self
             .buffer()
             .rope()
             .slice_bytes(start.value(), cursor_offset.value());
 
-        // Boundary 1: crossed a newline — seal the current line's batch.
-        // Each line gets its own undo unit so undo restores line by line.
+        // Boundary 1: crossed newline — seal current line's batch
         if deleted_char == "\n" && !self.pending_delete.is_empty() {
             self.flush_pending_delete();
         }
-
-        // Boundary 2: pause >= 2s — seal the batch, start a fresh one.
-        // Lets user undo back to wherever they paused mid-deletion.
+        // Boundary 2: pause >= 2s — seal batch
         if self.last_delete_time.elapsed().as_secs() >= 2 && !self.pending_delete.is_empty() {
             self.flush_pending_delete();
         }
 
-        // Save the buffer state BEFORE the first delete in this run.
         if self.pending_delete_start_buffer.is_none() {
             self.pending_delete_start_buffer = Some(Box::new(self.buffer().clone()));
             self.pending_delete_cursor_before = Some(cursor);
         }
-
         let mut new_buffer = self.buffer().clone();
         new_buffer.delete(start, cursor_offset);
         let cursor_after = new_buffer.offset_to_point(start);
-
         self.pending_edit_events.push(EditEvent {
             start_byte: start.value(),
             old_end_byte: cursor_offset.value(),
             new_end_byte: start.value(),
         });
-
-        // Deleted chars are prepended because we're going backwards.
         self.pending_delete.insert_str(0, &deleted_char);
-
-        // Live-update so the user sees each character disappear immediately.
         self.history.update_current(new_buffer);
         self.set_cursor(cursor_after);
         self.version += 1;
@@ -334,33 +296,30 @@ impl Editor {
     }
 
     pub fn delete(&mut self) {
+        if !self.selection.is_empty() {
+            self.delete_selection();
+            return;
+        }
         self.flush_pending_insert();
         self.flush_pending_delete();
-
         let cursor = self.cursor();
         let cursor_offset = self.buffer().point_to_offset(cursor);
-
         if cursor_offset.value() < self.buffer().len() {
             let end = Offset(cursor_offset.value() + 1);
-
             let deleted_text = self
                 .buffer()
                 .rope()
                 .slice_bytes(cursor_offset.value(), end.value());
-
             let old_buffer = self.buffer().clone();
             let mut new_buffer = old_buffer.clone();
             new_buffer.delete(cursor_offset, end);
-
             self.pending_edit_events.push(EditEvent {
                 start_byte: cursor_offset.value(),
                 old_end_byte: end.value(),
                 new_end_byte: cursor_offset.value(),
             });
-
             let transaction = Transaction::delete(deleted_text, cursor, cursor);
             self.history.push(old_buffer, new_buffer, transaction);
-
             self.version += 1;
             self.last_edit_time = Instant::now();
         }
@@ -371,7 +330,6 @@ impl Editor {
     // -------------------------------------------------------------------------
 
     pub fn undo(&mut self) {
-        // First flush any pending delete run as one unit, then undo it.
         if !self.pending_delete.is_empty() {
             self.flush_pending_delete();
             if let Some(transaction) = self.history.undo() {
@@ -380,9 +338,6 @@ impl Editor {
             }
             return;
         }
-
-        // Pending insert: revert the live buffer to before the word started,
-        // and push the word onto the redo stack so Ctrl+Y can bring it back.
         if !self.pending_insert.is_empty() {
             if let Some(before_buffer) = self.pending_start_buffer.take() {
                 let current_arc = self.history.current_arc();
@@ -391,9 +346,7 @@ impl Editor {
                     self.pending_start_cursor.unwrap_or_else(Point::zero),
                     self.cursor(),
                 );
-                // Push current state to redo so Ctrl+Y works.
                 self.history.push_redo(current_arc, transaction);
-
                 self.history.update_current((*before_buffer).clone());
                 if let Some(start_cursor) = self.pending_start_cursor {
                     self.set_cursor(start_cursor);
@@ -404,29 +357,23 @@ impl Editor {
             self.version += 1;
             return;
         }
-
-        // Normal undo — pop from undo stack.
         if let Some(transaction) = self.history.undo() {
             self.set_cursor(transaction.cursor_before);
             self.version += 1;
         }
-        // No EditEvent pushed — caller must full_reset the renderer.
     }
 
     pub fn redo(&mut self) {
-        // Discard any in-progress pending state before jumping forward.
         self.pending_insert.clear();
         self.pending_start_cursor = None;
         self.pending_start_buffer = None;
         self.pending_delete.clear();
         self.pending_delete_cursor_before = None;
         self.pending_delete_start_buffer = None;
-
         if let Some(transaction) = self.history.redo() {
             self.set_cursor(transaction.cursor_after);
             self.version += 1;
         }
-        // No EditEvent pushed — caller must full_reset the renderer.
     }
 
     pub fn can_undo(&self) -> bool {
@@ -440,12 +387,17 @@ impl Editor {
     }
 
     // -------------------------------------------------------------------------
-    // Cursor movement — flush both pending batches before moving
+    // Cursor movement
     // -------------------------------------------------------------------------
 
     pub fn move_left(&mut self) {
         self.flush_pending_insert();
         self.flush_pending_delete();
+        if !self.selection.is_empty() {
+            let (start, _) = self.selection.range();
+            self.set_cursor(start);
+            return;
+        }
         let cursor = self.cursor();
         if cursor.column > 0 {
             self.set_cursor(Point::new(cursor.row, cursor.column - 1));
@@ -459,6 +411,11 @@ impl Editor {
     pub fn move_right(&mut self) {
         self.flush_pending_insert();
         self.flush_pending_delete();
+        if !self.selection.is_empty() {
+            let (_, end) = self.selection.range();
+            self.set_cursor(end);
+            return;
+        }
         let cursor = self.cursor();
         if let Some(current_line) = self.buffer().line(cursor.row) {
             if cursor.column < current_line.len() {
@@ -475,11 +432,11 @@ impl Editor {
         let cursor = self.cursor();
         if cursor.row > 0 {
             let new_row = cursor.row - 1;
-            let column = if let Some(line) = self.buffer().line(new_row) {
-                cursor.column.min(line.len())
-            } else {
-                0
-            };
+            let column = self
+                .buffer()
+                .line(new_row)
+                .map(|l| cursor.column.min(l.len()))
+                .unwrap_or(0);
             self.set_cursor(Point::new(new_row, column));
         }
     }
@@ -490,11 +447,11 @@ impl Editor {
         let cursor = self.cursor();
         if cursor.row + 1 < self.buffer().line_count() {
             let new_row = cursor.row + 1;
-            let column = if let Some(line) = self.buffer().line(new_row) {
-                cursor.column.min(line.len())
-            } else {
-                0
-            };
+            let column = self
+                .buffer()
+                .line(new_row)
+                .map(|l| cursor.column.min(l.len()))
+                .unwrap_or(0);
             self.set_cursor(Point::new(new_row, column));
         }
     }
@@ -515,6 +472,430 @@ impl Editor {
         }
     }
 
+    /// Ctrl+← : jump to start of previous word
+    pub fn move_word_left(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        if !self.selection.is_empty() {
+            let (start, _) = self.selection.range();
+            self.set_cursor(start);
+            return;
+        }
+        let target = self.word_start_before_cursor();
+        self.set_cursor(target);
+    }
+
+    /// Ctrl+→ : jump to end of next word
+    pub fn move_word_right(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        if !self.selection.is_empty() {
+            let (_, end) = self.selection.range();
+            self.set_cursor(end);
+            return;
+        }
+        let target = self.word_end_after_cursor();
+        self.set_cursor(target);
+    }
+
+    /// Ctrl+Home
+    pub fn move_to_top(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        self.set_cursor(Point::zero());
+    }
+
+    /// Ctrl+End
+    pub fn move_to_bottom(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let last_row = self.buffer().line_count().saturating_sub(1);
+        let col = self.buffer().line(last_row).map(|l| l.len()).unwrap_or(0);
+        self.set_cursor(Point::new(last_row, col));
+    }
+
+    // -------------------------------------------------------------------------
+    // Word navigation helpers
+    // -------------------------------------------------------------------------
+
+    pub fn word_start_before_cursor(&self) -> Point {
+        let cursor = self.cursor();
+        let line = self.buffer().line(cursor.row).unwrap_or_default();
+        let chars: Vec<char> = line.chars().collect();
+
+        if cursor.column == 0 {
+            if cursor.row > 0 {
+                if let Some(prev_line) = self.buffer().line(cursor.row - 1) {
+                    return Point::new(cursor.row - 1, prev_line.len());
+                }
+            }
+            return cursor;
+        }
+
+        let mut col = cursor.column.min(chars.len());
+        while col > 0 && chars[col - 1].is_whitespace() {
+            col -= 1;
+        }
+        if col == 0 {
+            return Point::new(cursor.row, 0);
+        }
+        let is_word = Self::is_word_char(chars[col - 1]);
+        while col > 0 && Self::is_word_char(chars[col - 1]) == is_word {
+            col -= 1;
+        }
+        Point::new(cursor.row, col)
+    }
+
+    pub fn word_end_after_cursor(&self) -> Point {
+        let cursor = self.cursor();
+        let line = self.buffer().line(cursor.row).unwrap_or_default();
+        let chars: Vec<char> = line.chars().collect();
+
+        if cursor.column >= chars.len() {
+            if cursor.row + 1 < self.buffer().line_count() {
+                return Point::new(cursor.row + 1, 0);
+            }
+            return cursor;
+        }
+
+        let mut col = cursor.column;
+        while col < chars.len() && chars[col].is_whitespace() {
+            col += 1;
+        }
+        if col >= chars.len() {
+            return Point::new(cursor.row, chars.len());
+        }
+        let is_word = Self::is_word_char(chars[col]);
+        while col < chars.len() && Self::is_word_char(chars[col]) == is_word {
+            col += 1;
+        }
+        Point::new(cursor.row, col)
+    }
+
+    // -------------------------------------------------------------------------
+    // Selection
+    // -------------------------------------------------------------------------
+
+    fn extend_to(&mut self, new_end: Point) {
+        self.selection = Selection::new(self.selection.start, new_end);
+    }
+
+    /// Shift+←
+    pub fn extend_selection_left(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let end = self.selection.end;
+        let new_end = if end.column > 0 {
+            Point::new(end.row, end.column - 1)
+        } else if end.row > 0 {
+            let prev_len = self
+                .buffer()
+                .line(end.row - 1)
+                .map(|l| l.len())
+                .unwrap_or(0);
+            Point::new(end.row - 1, prev_len)
+        } else {
+            end
+        };
+        self.extend_to(new_end);
+    }
+
+    /// Shift+→
+    pub fn extend_selection_right(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let end = self.selection.end;
+        let new_end = if let Some(line) = self.buffer().line(end.row) {
+            if end.column < line.len() {
+                Point::new(end.row, end.column + 1)
+            } else if end.row + 1 < self.buffer().line_count() {
+                Point::new(end.row + 1, 0)
+            } else {
+                end
+            }
+        } else {
+            end
+        };
+        self.extend_to(new_end);
+    }
+
+    /// Shift+↑
+    pub fn extend_selection_up(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let end = self.selection.end;
+        if end.row > 0 {
+            let new_row = end.row - 1;
+            let col = self
+                .buffer()
+                .line(new_row)
+                .map(|l| end.column.min(l.len()))
+                .unwrap_or(0);
+            self.extend_to(Point::new(new_row, col));
+        }
+    }
+
+    /// Shift+↓
+    pub fn extend_selection_down(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let end = self.selection.end;
+        if end.row + 1 < self.buffer().line_count() {
+            let new_row = end.row + 1;
+            let col = self
+                .buffer()
+                .line(new_row)
+                .map(|l| end.column.min(l.len()))
+                .unwrap_or(0);
+            self.extend_to(Point::new(new_row, col));
+        }
+    }
+
+    /// Ctrl+Shift+←
+    pub fn extend_selection_word_left(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let saved_start = self.selection.start;
+        let target = self.word_start_before_cursor();
+        self.selection = Selection::new(saved_start, target);
+    }
+
+    /// Ctrl+Shift+→
+    pub fn extend_selection_word_right(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let saved_start = self.selection.start;
+        let target = self.word_end_after_cursor();
+        self.selection = Selection::new(saved_start, target);
+    }
+
+    /// Shift+Home
+    pub fn extend_selection_to_line_start(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let end = self.selection.end;
+        self.extend_to(Point::new(end.row, 0));
+    }
+
+    /// Shift+End
+    pub fn extend_selection_to_line_end(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let end = self.selection.end;
+        let col = self.buffer().line(end.row).map(|l| l.len()).unwrap_or(0);
+        self.extend_to(Point::new(end.row, col));
+    }
+
+    /// Ctrl+A
+    pub fn select_all(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let last_row = self.buffer().line_count().saturating_sub(1);
+        let last_col = self.buffer().line(last_row).map(|l| l.len()).unwrap_or(0);
+        self.selection = Selection::new(Point::zero(), Point::new(last_row, last_col));
+    }
+
+    /// Double click → select word under cursor
+    pub fn select_word_at_cursor(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let cursor = self.cursor();
+        let line = self.buffer().line(cursor.row).unwrap_or_default();
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            return;
+        }
+        let col = cursor.column.min(chars.len().saturating_sub(1));
+        let is_word = Self::is_word_char(chars[col]);
+        let mut start = col;
+        while start > 0 && Self::is_word_char(chars[start - 1]) == is_word {
+            start -= 1;
+        }
+        let mut end = col;
+        while end < chars.len() && Self::is_word_char(chars[end]) == is_word {
+            end += 1;
+        }
+        self.selection = Selection::new(Point::new(cursor.row, start), Point::new(cursor.row, end));
+    }
+
+    /// Triple click → select entire line
+    pub fn select_line_at_cursor(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let cursor = self.cursor();
+        let line_len = self.buffer().line(cursor.row).map(|l| l.len()).unwrap_or(0);
+        self.selection =
+            Selection::new(Point::new(cursor.row, 0), Point::new(cursor.row, line_len));
+    }
+
+    /// Return selected text, or None if no selection.
+    pub fn selected_text(&self) -> Option<String> {
+        if self.selection.is_empty() {
+            return None;
+        }
+        let (start, end) = self.selection.range();
+        let start_offset = self.buffer().point_to_offset(start);
+        let end_offset = self.buffer().point_to_offset(end);
+        Some(
+            self.buffer()
+                .slice_bytes(start_offset.value(), end_offset.value()),
+        )
+    }
+
+    /// Current line text with trailing newline — for whole-line copy.
+    pub fn current_line_text(&self) -> String {
+        let cursor = self.cursor();
+        let line = self.buffer().line(cursor.row).unwrap_or_default();
+        if cursor.row + 1 < self.buffer().line_count() {
+            format!("{}\n", line)
+        } else {
+            line
+        }
+    }
+
+    /// Delete selected text as one undo unit. Returns true if anything deleted.
+    pub fn delete_selection(&mut self) -> bool {
+        if self.selection.is_empty() {
+            return false;
+        }
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let (start, end) = self.selection.range();
+        let start_offset = self.buffer().point_to_offset(start);
+        let end_offset = self.buffer().point_to_offset(end);
+        let deleted_text = self
+            .buffer()
+            .slice_bytes(start_offset.value(), end_offset.value());
+        let old_buffer = self.buffer().clone();
+        let mut new_buffer = old_buffer.clone();
+        new_buffer.delete(start_offset, end_offset);
+        self.pending_edit_events.push(EditEvent {
+            start_byte: start_offset.value(),
+            old_end_byte: end_offset.value(),
+            new_end_byte: start_offset.value(),
+        });
+        let transaction = Transaction::delete(deleted_text, end, start);
+        self.history.push(old_buffer, new_buffer, transaction);
+        self.set_cursor(start);
+        self.version += 1;
+        true
+    }
+
+    /// Delete entire current line (Ctrl+Shift+K).
+    pub fn delete_line(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let cursor = self.cursor();
+        let line_count = self.buffer().line_count();
+
+        let (start_offset, end_offset) = if cursor.row + 1 < line_count {
+            let s = self.buffer().point_to_offset(Point::new(cursor.row, 0));
+            let e = self.buffer().point_to_offset(Point::new(cursor.row + 1, 0));
+            (s, e)
+        } else if cursor.row > 0 {
+            let prev_len = self
+                .buffer()
+                .line(cursor.row - 1)
+                .map(|l| l.len())
+                .unwrap_or(0);
+            let s = self
+                .buffer()
+                .point_to_offset(Point::new(cursor.row - 1, prev_len));
+            let end_col = self.buffer().line(cursor.row).map(|l| l.len()).unwrap_or(0);
+            let e = self
+                .buffer()
+                .point_to_offset(Point::new(cursor.row, end_col));
+            (s, e)
+        } else {
+            let end_col = self.buffer().line(0).map(|l| l.len()).unwrap_or(0);
+            let s = self.buffer().point_to_offset(Point::new(0, 0));
+            let e = self.buffer().point_to_offset(Point::new(0, end_col));
+            (s, e)
+        };
+
+        let deleted_text = self
+            .buffer()
+            .slice_bytes(start_offset.value(), end_offset.value());
+        let old_buffer = self.buffer().clone();
+        let mut new_buffer = old_buffer.clone();
+        new_buffer.delete(start_offset, end_offset);
+        let new_cursor = if cursor.row < new_buffer.line_count() {
+            Point::new(cursor.row, 0)
+        } else {
+            Point::new(new_buffer.line_count().saturating_sub(1), 0)
+        };
+        self.pending_edit_events.push(EditEvent {
+            start_byte: start_offset.value(),
+            old_end_byte: end_offset.value(),
+            new_end_byte: start_offset.value(),
+        });
+        let transaction = Transaction::delete(deleted_text, cursor, new_cursor);
+        self.history.push(old_buffer, new_buffer, transaction);
+        self.set_cursor(new_cursor);
+        self.version += 1;
+    }
+
+    /// Ctrl+Backspace
+    pub fn delete_word_backward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let cursor = self.cursor();
+        let target = self.word_start_before_cursor();
+        if target == cursor {
+            return;
+        }
+        let start_offset = self.buffer().point_to_offset(target);
+        let end_offset = self.buffer().point_to_offset(cursor);
+        let deleted_text = self
+            .buffer()
+            .slice_bytes(start_offset.value(), end_offset.value());
+        let old_buffer = self.buffer().clone();
+        let mut new_buffer = old_buffer.clone();
+        new_buffer.delete(start_offset, end_offset);
+        self.pending_edit_events.push(EditEvent {
+            start_byte: start_offset.value(),
+            old_end_byte: end_offset.value(),
+            new_end_byte: start_offset.value(),
+        });
+        let transaction = Transaction::delete(deleted_text, cursor, target);
+        self.history.push(old_buffer, new_buffer, transaction);
+        self.set_cursor(target);
+        self.version += 1;
+    }
+
+    /// Ctrl+Delete
+    pub fn delete_word_forward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+        let cursor = self.cursor();
+        let target = self.word_end_after_cursor();
+        if target == cursor {
+            return;
+        }
+        let start_offset = self.buffer().point_to_offset(cursor);
+        let end_offset = self.buffer().point_to_offset(target);
+        let deleted_text = self
+            .buffer()
+            .slice_bytes(start_offset.value(), end_offset.value());
+        let old_buffer = self.buffer().clone();
+        let mut new_buffer = old_buffer.clone();
+        new_buffer.delete(start_offset, end_offset);
+        self.pending_edit_events.push(EditEvent {
+            start_byte: start_offset.value(),
+            old_end_byte: end_offset.value(),
+            new_end_byte: start_offset.value(),
+        });
+        let transaction = Transaction::delete(deleted_text, cursor, cursor);
+        self.history.push(old_buffer, new_buffer, transaction);
+        self.version += 1;
+    }
+
     // -------------------------------------------------------------------------
     // Misc
     // -------------------------------------------------------------------------
@@ -527,16 +908,12 @@ impl Editor {
         self.buffer().line_count()
     }
 
-    /// Replace entire buffer content (used for formatting).
-    /// Caller must call ViewportRenderer::full_reset() after this.
     pub fn replace_all(&mut self, new_text: &str) {
         self.flush_pending_insert();
         self.flush_pending_delete();
-
         let old_cursor = self.cursor();
         let old_buffer = self.buffer().clone();
         let new_buffer = Buffer::from_text(new_text);
-
         let new_cursor = if old_cursor.row < new_buffer.line_count() {
             if let Some(line) = new_buffer.line(old_cursor.row) {
                 Point::new(old_cursor.row, old_cursor.column.min(line.len()))
@@ -551,11 +928,9 @@ impl Editor {
                 Point::zero()
             }
         };
-
         let old_text = self.text();
         let transaction =
             Transaction::replace(old_text, new_text.to_string(), old_cursor, new_cursor);
-
         self.history.push(old_buffer, new_buffer, transaction);
         self.set_cursor(new_cursor);
         self.version += 1;
@@ -568,7 +943,6 @@ impl Editor {
     ) -> Result<(), String> {
         let current_text = self.text();
         let had_trailing_newline = current_text.ends_with('\n');
-
         match formatter.format_text(&current_text, file_path) {
             Ok(mut formatted_text) => {
                 if !had_trailing_newline && formatted_text.ends_with('\n') {

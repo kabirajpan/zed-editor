@@ -10,6 +10,9 @@ pub struct EditEvent {
     pub start_byte: usize,
     pub old_end_byte: usize,
     pub new_end_byte: usize,
+    pub start_position: Point,
+    pub old_end_position: Point,
+    pub new_end_position: Point,
 }
 
 #[derive(Clone)]
@@ -110,6 +113,18 @@ impl Editor {
         std::mem::take(&mut self.pending_edit_events)
     }
 
+    /// Get the character at a specific point in the buffer.
+    pub fn char_at(&self, point: Point) -> Option<char> {
+        let offset = self.buffer().point_to_offset(point);
+        if offset.value() >= self.buffer().len() {
+            return None;
+        }
+        // Slice 4 bytes to ensure we capture at least one full UTF-8 character
+        let end = (offset.value() + 4).min(self.buffer().len());
+        let s = self.buffer().slice_bytes(offset.value(), end);
+        s.chars().next()
+    }
+
     // -------------------------------------------------------------------------
     // Word boundary
     // -------------------------------------------------------------------------
@@ -175,11 +190,69 @@ impl Editor {
             self.flush_pending_insert();
             let offset = self.buffer().point_to_offset(cursor_before);
             let rope = self.buffer().rope();
+
+            // ── CHECK FOR ELECTRIC BRACES ────────────────────────────────────
+            // Detect if we are between { and }
+            let mut is_braces = false;
+            if cursor_before.column > 0 {
+                let prev = self.char_at(Point::new(cursor_before.row, cursor_before.column - 1));
+                let next = self.char_at(cursor_before);
+                if prev == Some('{') && next == Some('}') {
+                    is_braces = true;
+                }
+            }
+
             let indent = self.indent_calculator.calculate_indent_with_rope(
                 rope,
                 cursor_before.row,
                 self.file_path.as_deref(),
             );
+
+            if is_braces {
+                // Determine the base indentation
+                let line_text = rope.line(cursor_before.row).unwrap_or_default();
+                let base_indent: String = line_text
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .collect();
+
+                // For Electric Braces, we ALWAYS want one extra level of indentation 
+                // regardless of whether the brackets on the current line are "balanced"
+                let indent = format!("{}{}", base_indent, " ".repeat(4));
+
+                // Multi-line expansion: { \n    | \n }
+                let text_to_insert = format!("\n{}\n{}", indent, base_indent);
+                let old_buffer = self.buffer().clone();
+                let mut new_buffer = old_buffer.clone();
+                new_buffer.insert(offset, &text_to_insert);
+
+                // End position is end of inserted text
+                let new_offset = offset.value() + text_to_insert.len();
+                let cursor_after_final = new_buffer.offset_to_point(Offset(new_offset));
+
+                self.pending_edit_events.push(EditEvent {
+                    start_byte: offset.value(),
+                    old_end_byte: offset.value(),
+                    new_end_byte: offset.value() + text_to_insert.len(),
+                    start_position: cursor_before,
+                    old_end_position: cursor_before,
+                    new_end_position: cursor_after_final,
+                });
+
+                let transaction = Transaction::insert(text_to_insert, cursor_before, cursor_after_final);
+
+                // Set cursor to the middle line (indented). Calculate BEFORE moving new_buffer.
+                let middle_line_offset = offset.value() + 1 + indent.len();
+                let cursor_middle = new_buffer.offset_to_point(Offset(middle_line_offset));
+
+                self.history.push(old_buffer, new_buffer, transaction);
+
+                self.set_cursor(cursor_middle);
+                self.version += 1;
+                self.last_edit_time = Instant::now();
+                return;
+            }
+
             let text_to_insert = format!("\n{}", indent);
             let old_buffer = self.buffer().clone();
             let mut new_buffer = old_buffer.clone();
@@ -190,6 +263,9 @@ impl Editor {
                 start_byte: offset.value(),
                 old_end_byte: offset.value(),
                 new_end_byte: offset.value() + text_to_insert.len(),
+                start_position: cursor_before,
+                old_end_position: cursor_before,
+                new_end_position: cursor_after,
             });
             let transaction = Transaction::insert(text_to_insert, cursor_before, cursor_after);
             self.history.push(old_buffer, new_buffer, transaction);
@@ -214,6 +290,9 @@ impl Editor {
                 start_byte: offset.value(),
                 old_end_byte: offset.value(),
                 new_end_byte: offset.value() + text.len(),
+                start_position: cursor_before,
+                old_end_position: cursor_before,
+                new_end_position: cursor_after,
             });
             self.history.update_current(new_buffer);
             self.set_cursor(cursor_after);
@@ -238,12 +317,81 @@ impl Editor {
             start_byte: offset.value(),
             old_end_byte: offset.value(),
             new_end_byte: offset.value() + text.len(),
+            start_position: cursor_before,
+            old_end_position: cursor_before,
+            new_end_position: cursor_after,
         });
         self.history.update_current(new_buffer);
         self.set_cursor(cursor_after);
         self.version += 1;
         self.last_edit_time = Instant::now();
         self.pending_insert.push_str(text);
+
+        // If this is a block insert (e.g. from a past or multi-char macro),
+        // flush it immediately so it becomes its own undo step.
+        if text.len() > 1 {
+            self.flush_pending_insert();
+        }
+    }
+
+    /// Paste text into the editor, replacing selection if any.
+    /// Unlike insert(), this always flushes and uses a single transaction
+    /// for selection replacement.
+    pub fn paste(&mut self, text: &str) {
+        if self.selection.is_empty() {
+            self.insert(text);
+            self.flush_pending_insert();
+            return;
+        }
+
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+
+        let (sel_start, sel_end) = self.selection.range();
+        let start_offset = self.buffer().point_to_offset(sel_start);
+        let end_offset = self.buffer().point_to_offset(sel_end);
+        let old_text = self
+            .buffer()
+            .slice_bytes(start_offset.value(), end_offset.value());
+
+        let old_buffer = self.buffer().clone();
+        let mut new_buffer = old_buffer.clone();
+
+        new_buffer.delete(start_offset, end_offset);
+        new_buffer.insert(start_offset, text);
+
+        let new_byte_offset = start_offset.value() + text.len();
+        let cursor_after = new_buffer.offset_to_point(Offset(new_byte_offset));
+
+        self.pending_edit_events.push(EditEvent {
+            start_byte: start_offset.value(),
+            old_end_byte: end_offset.value(),
+            new_end_byte: new_byte_offset,
+            start_position: sel_start,
+            old_end_position: sel_end,
+            new_end_position: cursor_after,
+        });
+
+        // Use Replace transaction for atomic undo/redo of the selection replacement.
+        let transaction =
+            Transaction::replace(old_text, text.to_string(), self.cursor(), cursor_after);
+        self.history.push(old_buffer, new_buffer, transaction);
+        self.set_cursor(cursor_after);
+        self.version += 1;
+        self.last_edit_time = Instant::now();
+    }
+
+    /// Paste a whole line (VS Code behaviour).
+    /// Always pastes as a new line above the current cursor position.
+    pub fn paste_line(&mut self, text: &str) {
+        self.flush_pending_insert();
+        let row = self.cursor().row;
+        self.set_cursor(crate::buffer::Point::new(row, 0));
+        self.insert(text);
+        if !text.ends_with('\n') {
+            self.insert("\n");
+        }
+        self.flush_pending_insert();
     }
 
     pub fn backspace(&mut self) {
@@ -286,6 +434,9 @@ impl Editor {
             start_byte: start.value(),
             old_end_byte: cursor_offset.value(),
             new_end_byte: start.value(),
+            start_position: cursor_after,
+            old_end_position: cursor,
+            new_end_position: cursor_after,
         });
         self.pending_delete.insert_str(0, &deleted_char);
         self.history.update_current(new_buffer);
@@ -317,6 +468,9 @@ impl Editor {
                 start_byte: cursor_offset.value(),
                 old_end_byte: end.value(),
                 new_end_byte: cursor_offset.value(),
+                start_position: cursor,
+                old_end_position: new_buffer.offset_to_point(end), // Use point before delete
+                new_end_position: cursor,
             });
             let transaction = Transaction::delete(deleted_text, cursor, cursor);
             self.history.push(old_buffer, new_buffer, transaction);
@@ -333,6 +487,15 @@ impl Editor {
         if !self.pending_delete.is_empty() {
             self.flush_pending_delete();
             if let Some(transaction) = self.history.undo() {
+                let (start, old_end, new_end) = self.compute_txn_ranges(&transaction, true);
+                self.pending_edit_events.push(EditEvent {
+                    start_byte: start.0.value(),
+                    old_end_byte: old_end.0.value(),
+                    new_end_byte: new_end.0.value(),
+                    start_position: start.1,
+                    old_end_position: old_end.1,
+                    new_end_position: new_end.1,
+                });
                 self.set_cursor(transaction.cursor_before);
                 self.version += 1;
             }
@@ -358,6 +521,15 @@ impl Editor {
             return;
         }
         if let Some(transaction) = self.history.undo() {
+            let (start, old_end, new_end) = self.compute_txn_ranges(&transaction, true);
+            self.pending_edit_events.push(EditEvent {
+                start_byte: start.0.value(),
+                old_end_byte: old_end.0.value(),
+                new_end_byte: new_end.0.value(),
+                start_position: start.1,
+                old_end_position: old_end.1,
+                new_end_position: new_end.1,
+            });
             self.set_cursor(transaction.cursor_before);
             self.version += 1;
         }
@@ -371,6 +543,15 @@ impl Editor {
         self.pending_delete_cursor_before = None;
         self.pending_delete_start_buffer = None;
         if let Some(transaction) = self.history.redo() {
+            let (start, old_end, new_end) = self.compute_txn_ranges(&transaction, false);
+            self.pending_edit_events.push(EditEvent {
+                start_byte: start.0.value(),
+                old_end_byte: old_end.0.value(),
+                new_end_byte: new_end.0.value(),
+                start_position: start.1,
+                old_end_position: old_end.1,
+                new_end_position: new_end.1,
+            });
             self.set_cursor(transaction.cursor_after);
             self.version += 1;
         }
@@ -773,6 +954,9 @@ impl Editor {
             start_byte: start_offset.value(),
             old_end_byte: end_offset.value(),
             new_end_byte: start_offset.value(),
+            start_position: start,
+            old_end_position: end,
+            new_end_position: start,
         });
         let transaction = Transaction::delete(deleted_text, end, start);
         self.history.push(old_buffer, new_buffer, transaction);
@@ -828,6 +1012,13 @@ impl Editor {
             start_byte: start_offset.value(),
             old_end_byte: end_offset.value(),
             new_end_byte: start_offset.value(),
+            start_position: Point::new(cursor.row, 0),
+            old_end_position: if cursor.row + 1 < old_buffer.line_count() {
+                Point::new(cursor.row + 1, 0)
+            } else {
+                Point::new(cursor.row, old_buffer.line(cursor.row).map(|l| l.len()).unwrap_or(0))
+            },
+            new_end_position: Point::new(cursor.row, 0),
         });
         let transaction = Transaction::delete(deleted_text, cursor, new_cursor);
         self.history.push(old_buffer, new_buffer, transaction);
@@ -859,6 +1050,9 @@ impl Editor {
             start_byte: start_offset.value(),
             old_end_byte: end_offset.value(),
             new_end_byte: start_offset.value(),
+            start_position: target,
+            old_end_position: cursor,
+            new_end_position: target,
         });
         let transaction = Transaction::delete(deleted_text, cursor, target);
         self.history.push(old_buffer, new_buffer, transaction);
@@ -890,6 +1084,9 @@ impl Editor {
             start_byte: start_offset.value(),
             old_end_byte: end_offset.value(),
             new_end_byte: start_offset.value(),
+            start_position: cursor,
+            old_end_position: target,
+            new_end_position: cursor,
         });
         let transaction = Transaction::delete(deleted_text, cursor, cursor);
         self.history.push(old_buffer, new_buffer, transaction);
@@ -899,6 +1096,53 @@ impl Editor {
     // -------------------------------------------------------------------------
     // Misc
     // -------------------------------------------------------------------------
+
+    fn compute_txn_ranges(
+        &self,
+        txn: &Transaction,
+        is_undo: bool,
+    ) -> ((Offset, Point), (Offset, Point), (Offset, Point)) {
+        use crate::history::transaction::EditKind;
+        let buffer = self.buffer();
+        match &txn.edit {
+            EditKind::Insert { text } => {
+                let start_pos = txn.cursor_before;
+                let start_offset = buffer.point_to_offset(start_pos);
+                let end_pos = txn.cursor_after;
+                let end_offset = Offset(start_offset.value() + text.len());
+
+                if is_undo {
+                    ((start_offset, start_pos), (end_offset, end_pos), (start_offset, start_pos))
+                } else {
+                    ((start_offset, start_pos), (start_offset, start_pos), (end_offset, end_pos))
+                }
+            }
+            EditKind::Delete { text } => {
+                let start_pos = txn.cursor_after;
+                let start_offset = buffer.point_to_offset(start_pos);
+                let end_pos = txn.cursor_before;
+                let end_offset = Offset(start_offset.value() + text.len());
+
+                if is_undo {
+                    ((start_offset, start_pos), (start_offset, start_pos), (end_offset, end_pos))
+                } else {
+                    ((start_offset, start_pos), (end_offset, end_pos), (start_offset, start_pos))
+                }
+            }
+            EditKind::Replace { old_text, new_text } => {
+                let start_pos = Point::zero();
+                let start_offset = Offset(0);
+                let old_len = old_text.len();
+                let new_len = new_text.len();
+
+                if is_undo {
+                    ((start_offset, start_pos), (Offset(new_len), buffer.offset_to_point(Offset(new_len))), (Offset(old_len), buffer.offset_to_point(Offset(old_len))))
+                } else {
+                    ((start_offset, start_pos), (Offset(old_len), buffer.offset_to_point(Offset(old_len))), (Offset(new_len), buffer.offset_to_point(Offset(new_len))))
+                }
+            }
+        }
+    }
 
     pub fn text(&self) -> String {
         self.buffer().to_string()
@@ -931,6 +1175,14 @@ impl Editor {
         let old_text = self.text();
         let transaction =
             Transaction::replace(old_text, new_text.to_string(), old_cursor, new_cursor);
+        self.pending_edit_events.push(EditEvent {
+            start_byte: 0,
+            old_end_byte: old_buffer.len(),
+            new_end_byte: new_buffer.len(),
+            start_position: Point::zero(),
+            old_end_position: old_buffer.offset_to_point(Offset(old_buffer.len())),
+            new_end_position: new_buffer.offset_to_point(Offset(new_buffer.len())),
+        });
         self.history.push(old_buffer, new_buffer, transaction);
         self.set_cursor(new_cursor);
         self.version += 1;

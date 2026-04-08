@@ -5,7 +5,8 @@ pub mod gui;
 pub mod history;
 pub mod io;
 pub mod rope;
-pub mod syntax; // ADD THIS
+pub mod manager;
+pub mod syntax;
 pub mod tree;
 pub mod ui;
 pub mod util;

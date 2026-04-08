@@ -1,4 +1,3 @@
-use crate::buffer::Point;
 use crate::editor::selection::Selection;
 use crate::formatter::providers::{PrettierProvider, RustfmtProvider};
 use crate::io::write_file_from_rope;
@@ -6,7 +5,7 @@ use crate::{read_file, Editor, Formatter, SyntaxHighlighter, SyntaxTheme};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use super::focus::{ActivePanels, FocusManager, FocusTarget};
+use crate::manager::{FocusTarget, GlobalManager};
 use super::viewport_renderer::ViewportRenderer;
 
 #[derive(Clone, Debug)]
@@ -28,21 +27,16 @@ pub struct GuiApp {
     loading_state: LoadingState,
     renderer: ViewportRenderer,
     formatter: Formatter,
-    highlighter: SyntaxHighlighter,
 
-    focus: FocusManager,
-    active_panels: ActivePanels,
-
-    // Clipboard state
-    // We store what we last copied so we know whether to do a line-paste or
-    // a regular paste.  clipboard_is_line is true when Ctrl+C/X was pressed
-    // with no selection (whole-line copy, like VS Code).
-    clipboard: String,
-    clipboard_is_line: bool,
+    manager: GlobalManager,
 
     // Click tracking for triple-click detection
     last_click_time: Instant,
     click_count: u8,
+
+    // Pending actions to be handled after the event loop
+    pending_copy: bool,
+    pending_cut: bool,
 }
 
 impl GuiApp {
@@ -52,6 +46,8 @@ impl GuiApp {
         formatter.register(Box::new(PrettierProvider::new()));
 
         let highlighter = SyntaxHighlighter::new(SyntaxTheme::dark());
+        let mut renderer = ViewportRenderer::new();
+        renderer.highlighter = highlighter;
 
         Self {
             editor: Editor::new(),
@@ -62,20 +58,18 @@ impl GuiApp {
             auto_scroll: true,
             current_file: None,
             loading_state: LoadingState::Idle,
-            renderer: ViewportRenderer::new(),
+            renderer,
             formatter,
-            highlighter,
-            focus: FocusManager::new(),
-            active_panels: ActivePanels::default(),
-            clipboard: String::new(),
-            clipboard_is_line: false,
+            manager: GlobalManager::new(),
             last_click_time: Instant::now(),
             click_count: 0,
+            pending_copy: false,
+            pending_cut: false,
         }
     }
 
     fn handle_text_input(&mut self, text: &str) {
-        if !self.focus.is_focused(FocusTarget::Editor) {
+        if !self.manager.focus.is_focused(FocusTarget::Editor) {
             return;
         }
 
@@ -105,11 +99,13 @@ impl GuiApp {
         self.renderer.invalidate_from_line(cursor_line);
     }
 
-    fn handle_key(&mut self, key: egui::Key, modifiers: egui::Modifiers, ctx: &egui::Context) {
+    fn handle_key(&mut self, key: egui::Key, modifiers: egui::Modifiers, _ctx: &egui::Context) {
         // ── Tab (focus cycling or indent) ────────────────────────────────────
         if key == egui::Key::Tab {
-            let consumed = self.focus.handle_tab(modifiers.shift, &self.active_panels);
-            if !consumed && self.focus.is_focused(FocusTarget::Editor) {
+            if self.manager.focus.handle_tab(modifiers.shift, &self.manager.panels) {
+                return;
+            }
+            if self.manager.focus.is_focused(FocusTarget::Editor) {
                 let cursor_line = self.editor.cursor().row;
                 self.editor.insert("    ");
                 self.status_message.clear();
@@ -121,11 +117,11 @@ impl GuiApp {
             return;
         }
 
-        if !self.focus.is_focused(FocusTarget::Editor) {
+        if !self.manager.focus.is_focused(FocusTarget::Editor) {
             return;
         }
 
-        self.focus.on_key_pressed();
+        self.manager.focus.on_key_pressed();
         let cursor_before = self.editor.cursor();
 
         match key {
@@ -203,13 +199,11 @@ impl GuiApp {
                 let cursor_line = self.editor.cursor().row;
                 if modifiers.ctrl {
                     self.editor.delete_word_backward();
-                    self.renderer.full_reset();
                 } else {
                     self.editor.backspace();
-                    self.renderer
-                        .invalidate_from_line(cursor_line.saturating_sub(1));
                 }
                 self.status_message.clear();
+                self.renderer.invalidate_from_line(cursor_line);
             }
 
             // ── Delete ───────────────────────────────────────────────────────
@@ -217,16 +211,14 @@ impl GuiApp {
                 let cursor_line = self.editor.cursor().row;
                 if modifiers.ctrl {
                     self.editor.delete_word_forward();
-                    self.renderer.full_reset();
                 } else if modifiers.shift {
                     // Ctrl+Shift+K equivalent on some keyboards
                     self.editor.delete_line();
-                    self.renderer.full_reset();
                 } else {
                     self.editor.delete();
-                    self.renderer.invalidate_line(cursor_line);
                 }
                 self.status_message.clear();
+                self.renderer.invalidate_from_line(cursor_line);
             }
 
             // ── Enter ────────────────────────────────────────────────────────
@@ -242,48 +234,10 @@ impl GuiApp {
                 self.editor.select_all();
             }
 
-            egui::Key::C if modifiers.ctrl => {
-                let text = if let Some(selected) = self.editor.selected_text() {
-                    self.clipboard_is_line = false;
-                    selected
-                } else {
-                    // No selection — copy whole line (VS Code behaviour)
-                    self.clipboard_is_line = true;
-                    self.editor.current_line_text()
-                };
-                self.clipboard = text.clone();
-                ctx.output_mut(|o| o.copied_text = text);
-            }
-
-            egui::Key::X if modifiers.ctrl => {
-                let text = if let Some(selected) = self.editor.selected_text() {
-                    self.clipboard_is_line = false;
-                    self.editor.delete_selection();
-                    self.renderer.full_reset();
-                    selected
-                } else {
-                    // No selection — cut whole line
-                    self.clipboard_is_line = true;
-                    let line_text = self.editor.current_line_text();
-                    self.editor.delete_line();
-                    self.renderer.full_reset();
-                    line_text
-                };
-                self.clipboard = text.clone();
-                ctx.output_mut(|o| o.copied_text = text);
-                self.status_message.clear();
-            }
-
-            egui::Key::V if modifiers.ctrl => {
-                // Paste is handled via egui::Event::Paste in the event loop
-                // to get the actual OS clipboard text. Nothing to do here.
-            }
-
             egui::Key::Z if modifiers.ctrl => {
                 if self.editor.can_undo() {
                     self.editor.undo();
                     self.status_message = "Undo".to_string();
-                    self.renderer.full_reset();
                 }
             }
 
@@ -291,14 +245,12 @@ impl GuiApp {
                 if self.editor.can_redo() {
                     self.editor.redo();
                     self.status_message = "Redo".to_string();
-                    self.renderer.full_reset();
                 }
             }
 
             egui::Key::K if modifiers.ctrl && modifiers.shift => {
                 // Ctrl+Shift+K — delete line (VS Code)
                 self.editor.delete_line();
-                self.renderer.full_reset();
                 self.status_message.clear();
             }
 
@@ -314,6 +266,20 @@ impl GuiApp {
                 self.format_code();
             }
 
+            // ── Clipboard Fallbacks ──────────────────────────────────────────
+            // We handle these here directly to ensure the internal buffer is 
+            // updated INSTANTLY, bypasssing any OS/egui sync delays.
+            egui::Key::C if modifiers.ctrl => {
+                self.pending_copy = true;
+            }
+            egui::Key::X if modifiers.ctrl => {
+                self.pending_cut = true;
+            }
+            egui::Key::V if modifiers.ctrl => {
+                // We'll let the main event loop's Paste event handle this
+                // to get the text, but catching it here ensures focus logic.
+            }
+
             _ => {}
         }
 
@@ -322,30 +288,61 @@ impl GuiApp {
             self.auto_scroll = true;
         }
     }
-
-    fn do_paste(&mut self, text: String) {
-        if !self.focus.is_focused(FocusTarget::Editor) {
+    fn do_copy(&mut self, ctx: &egui::Context) {
+        if !self.manager.focus.is_focused(FocusTarget::Editor) {
             return;
         }
 
-        // Check if this is a whole-line paste (we copied a line ourselves)
-        let is_line_paste = self.clipboard_is_line && text == self.clipboard;
+        let is_line;
+        let text = if let Some(selected) = self.editor.selected_text() {
+            is_line = false;
+            selected
+        } else {
+            is_line = true;
+            self.editor.current_line_text()
+        };
+
+        self.manager.clipboard.copy(text, is_line, ctx);
+    }
+
+    fn do_cut(&mut self, ctx: &egui::Context) {
+        if !self.manager.focus.is_focused(FocusTarget::Editor) {
+            return;
+        }
+        self.do_copy(ctx);
+        self.editor.delete_selection();
+        self.status_message.clear();
+    }
+
+
+    fn do_paste(&mut self, os_text: String) {
+        if !self.manager.focus.is_focused(FocusTarget::Editor) {
+            return;
+        }
+
+        let (text, is_line_paste) = self.manager.clipboard.paste(os_text);
+
+        let refresh_row = if self.editor.selection().is_empty() {
+            self.editor.cursor().row
+        } else {
+            self.editor.selection().range().0.row
+        };
 
         if is_line_paste {
             // VS Code line paste: insert as a new line ABOVE the current line
             self.editor.move_to_line_start();
-            self.editor.insert(&text); // text already has trailing \n
+            self.editor.paste(&text); // text already has trailing \n
             self.editor.move_up();
         } else {
             // Regular paste — replaces selection if any
-            self.editor.insert(&text);
+            self.editor.paste(&text);
         }
 
-        self.renderer.full_reset();
         self.status_message.clear();
         self.auto_scroll = true;
         self.last_input_time = Instant::now();
         self.cursor_blink = true;
+        self.renderer.invalidate_from_line(refresh_row);
     }
 
     fn format_code(&mut self) {
@@ -495,18 +492,6 @@ impl eframe::App for GuiApp {
         }
         ctx.request_repaint();
 
-        // ── Drain edit events → highlighter ──────────────────────────────────
-        {
-            let events = self.editor.drain_edit_events();
-            for e in events {
-                self.renderer.notify_edit(
-                    self.editor.buffer().rope(),
-                    e.start_byte,
-                    e.old_end_byte,
-                    e.new_end_byte,
-                );
-            }
-        }
 
         // ── Tab key (consumed before general input) ───────────────────────────
         let mut tab_pressed = false;
@@ -528,6 +513,9 @@ impl eframe::App for GuiApp {
 
         // ── Main input event loop ─────────────────────────────────────────────
         let mut paste_text: Option<String> = None;
+        let mut do_copy = false;
+        let mut do_cut = false;
+
         ctx.input(|i| {
             for event in &i.events {
                 match event {
@@ -536,6 +524,18 @@ impl eframe::App for GuiApp {
                     }
                     egui::Event::Paste(text) => {
                         paste_text = Some(text.clone());
+                    }
+                    egui::Event::Copy => {
+                        // Only copy if we haven't already handled it this frame
+                        do_copy = true;
+                    }
+                    egui::Event::Cut => {
+                        do_cut = true;
+                    }
+                    egui::Event::WindowFocused(focused) => {
+                        if !focused {
+                            self.manager.clipboard.invalidate_internal();
+                        }
                     }
                     egui::Event::Key {
                         key,
@@ -582,7 +582,16 @@ impl eframe::App for GuiApp {
             self.handle_key(key, modifiers, ctx);
         }
 
+        if self.pending_copy || do_copy {
+            self.do_copy(ctx);
+            self.pending_copy = false;
+        }
+        if self.pending_cut || do_cut {
+            self.do_cut(ctx);
+            self.pending_cut = false;
+        }
         if let Some(text) = paste_text {
+            // Priority: do_paste will check manager's freshness tracking
             self.do_paste(text);
         }
 
@@ -614,7 +623,6 @@ impl eframe::App for GuiApp {
                         .clicked()
                     {
                         self.editor.undo();
-                        self.renderer.full_reset();
                         ui.close_menu();
                     }
                     if ui
@@ -622,12 +630,28 @@ impl eframe::App for GuiApp {
                         .clicked()
                     {
                         self.editor.redo();
-                        self.renderer.full_reset();
                         ui.close_menu();
                     }
                     ui.separator();
                     if ui.button("📋 Select All (Ctrl+A)").clicked() {
                         self.editor.select_all();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("📄 Copy (Ctrl+C)").clicked() {
+                        self.do_copy(ctx);
+                        ui.close_menu();
+                    }
+                    if ui.button("✂ Cut (Ctrl+X)").clicked() {
+                        self.do_cut(ctx);
+                        ui.close_menu();
+                    }
+                    if ui.button("📋 Paste (Ctrl+V)").clicked() {
+                        // Request paste text from egui if possible
+                        // Note: actual text will arrive via egui::Event::Paste
+                        ui.ctx().output_mut(|_o| {
+                            // Some platforms support this to request clipboard
+                        });
                         ui.close_menu();
                     }
                     ui.separator();
@@ -685,7 +709,7 @@ impl eframe::App for GuiApp {
                 ui.label(status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        egui::RichText::new(self.focus.status_label())
+                        egui::RichText::new(self.manager.focus.status_label())
                             .color(egui::Color32::from_rgb(100, 160, 255))
                             .small(),
                     );
@@ -697,7 +721,14 @@ impl eframe::App for GuiApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if ui.rect_contains_pointer(ui.max_rect()) && ctx.input(|i| i.pointer.primary_clicked())
             {
-                self.focus.set(FocusTarget::Editor);
+                self.manager.focus.set(FocusTarget::Editor);
+            }
+
+            {
+                let events = self.editor.drain_edit_events();
+                for e in events {
+                    self.renderer.notify_edit(self.editor.buffer().rope(), &e);
+                }
             }
 
             let interaction = self.renderer.render_with_highlighting(

@@ -37,7 +37,7 @@ pub struct ViewportRenderer {
     width_cache: HashMap<String, f32>,
     last_version: u64,
     frame_count: u64,
-    highlighter: SyntaxHighlighter,
+    pub highlighter: SyntaxHighlighter,
     last_viewport: (usize, usize),
 
     // Layout state stored after each render — used by screen_to_point
@@ -66,12 +66,9 @@ impl ViewportRenderer {
     pub fn notify_edit(
         &mut self,
         rope: &crate::rope::Rope,
-        start_byte: usize,
-        old_end_byte: usize,
-        new_end_byte: usize,
+        event: &crate::editor::EditEvent,
     ) {
-        self.highlighter
-            .notify_edit(rope, start_byte, old_end_byte, new_end_byte);
+        self.highlighter.notify_edit(rope, event);
     }
 
     pub fn full_reset(&mut self) {

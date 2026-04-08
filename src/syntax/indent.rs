@@ -173,13 +173,11 @@ impl IndentCalculator {
         if let Some(line_text) = rope.line(cursor_line) {
             let trimmed = line_text.trim();
             let indent = Self::get_line_indent(&line_text);
-            let opens = trimmed.matches('{').count()
-                + trimmed.matches('[').count()
-                + trimmed.matches('(').count();
-            let closes = trimmed.matches('}').count()
-                + trimmed.matches(']').count()
-                + trimmed.matches(')').count();
-            if opens > closes {
+            if trimmed.ends_with('{')
+                || trimmed.ends_with('[')
+                || trimmed.ends_with('(')
+                || trimmed.ends_with(':')
+            {
                 format!("{}{}", indent, " ".repeat(self.indent_width))
             } else {
                 indent
@@ -197,13 +195,11 @@ impl IndentCalculator {
         let current_line = lines[cursor_line];
         let indent = Self::get_line_indent(current_line);
         let trimmed = current_line.trim();
-        let opens = trimmed.matches('{').count()
-            + trimmed.matches('[').count()
-            + trimmed.matches('(').count();
-        let closes = trimmed.matches('}').count()
-            + trimmed.matches(']').count()
-            + trimmed.matches(')').count();
-        if opens > closes || trimmed.ends_with(':') {
+        if trimmed.ends_with('{')
+            || trimmed.ends_with('[')
+            || trimmed.ends_with('(')
+            || trimmed.ends_with(':')
+        {
             format!("{}{}", indent, " ".repeat(self.indent_width))
         } else {
             indent

@@ -64,38 +64,34 @@ impl SyntaxHighlighter {
     pub fn notify_edit(
         &mut self,
         rope: &crate::rope::Rope,
-        start_byte: usize,
-        old_end_byte: usize,
-        new_end_byte: usize,
+        event: &crate::editor::EditEvent,
     ) {
         self.highlight_cache = None;
-
         let parse_state = match self.parse_state.as_mut() {
             Some(s) => s,
             None => return,
         };
 
-        // parse_state.text is always stored with a trailing '\n'.
-        // Use it directly for the old positions.
-        let start_pos = byte_to_point(&parse_state.text, start_byte);
-        let old_end_pos = byte_to_point(&parse_state.text, old_end_byte);
-
-        // Build the new text WITH trailing '\n' to match highlight_viewport.
-        let new_text = rope_to_text_with_newline(rope);
-        let new_end_pos = byte_to_point(&new_text, new_end_byte);
-
         let edit = InputEdit {
-            start_byte,
-            old_end_byte,
-            new_end_byte,
-            start_position: start_pos,
-            old_end_position: old_end_pos,
-            new_end_position: new_end_pos,
+            start_byte: event.start_byte,
+            old_end_byte: event.old_end_byte,
+            new_end_byte: event.new_end_byte,
+            start_position: TsPoint {
+                row: event.start_position.row,
+                column: event.start_position.column,
+            },
+            old_end_position: TsPoint {
+                row: event.old_end_position.row,
+                column: event.old_end_position.column,
+            },
+            new_end_position: TsPoint {
+                row: event.new_end_position.row,
+                column: event.new_end_position.column,
+            },
         };
 
         parse_state.tree.edit(&edit);
-        // Keep parse_state.text in sync (with trailing '\n').
-        parse_state.text = new_text;
+        parse_state.text = rope_to_text_with_newline(rope);
     }
 
     fn ensure_query_compiled(&mut self, config: &LanguageConfig) -> bool {
@@ -160,6 +156,17 @@ impl SyntaxHighlighter {
         // with what notify_edit stores.
         let full_text = rope_to_text_with_newline(rope);
 
+        // Safety Guard: Detect out-of-sync state that would cause panics.
+        // We allow the tree to be exactly 1 byte different if it's just the trailing newline.
+        // Safety Guard: Detect out-of-sync state that would cause panics.
+        if let Some(state) = &self.parse_state {
+            let root = state.tree.root_node();
+            if root.end_byte() != full_text.len() {
+                eprintln!("[SyntaxHighlighter] Sync discrepancy detected (tree={} bytes, buffer={} bytes). Resetting.", root.end_byte(), full_text.len());
+                self.parse_state = None;
+            }
+        }
+
         let old_tree = self.parse_state.as_ref().map(|s| &s.tree);
 
         let tree = match self.parser.parse(&full_text, old_tree) {
@@ -194,6 +201,12 @@ impl SyntaxHighlighter {
 
         let mut all_lines: HashMap<usize, Vec<(usize, usize, Color32)>> = HashMap::new();
         let mut cursor = QueryCursor::new();
+
+        // 🚀 OPTIMIZATION: Restrict query to visible viewport byte range
+        let start_byte = rope.line_to_byte(visible_start);
+        let end_byte = rope.line_to_byte(visible_end.min(rope.line_count()));
+        cursor.set_byte_range(start_byte..end_byte);
+
         let root_node = tree.root_node();
 
         for match_ in cursor.matches(query, root_node, full_text.as_bytes()) {
@@ -201,9 +214,19 @@ impl SyntaxHighlighter {
                 let node = capture.node;
                 let node_start = node.start_position();
                 let node_end = node.end_position();
+
+                // Skip if entirely outside visible viewport
+                if node_end.row < visible_start || node_start.row >= visible_end {
+                    continue;
+                }
+
                 let color = color_map[capture.index as usize];
 
-                for row in node_start.row..=node_end.row {
+                // 🚀 OPTIMIZATION: Only iterate visible rows
+                let row_start = node_start.row.max(visible_start);
+                let row_end = node_end.row.min(visible_end.saturating_sub(1));
+
+                for row in row_start..=row_end {
                     let line_str = match rope.line(row) {
                         Some(s) => s,
                         None => continue,
@@ -270,9 +293,7 @@ impl SyntaxHighlighter {
 /// always consistent with what is stored in parse_state.text.
 fn rope_to_text_with_newline(rope: &crate::rope::Rope) -> String {
     let mut t = rope.to_string();
-    if !t.ends_with('\n') {
-        t.push('\n');
-    }
+    t.push('\n'); // Always append a newline for consistency
     t
 }
 

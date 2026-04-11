@@ -108,7 +108,11 @@ impl GuiApp {
             }
             if self.manager.focus.is_focused(FocusTarget::Editor) {
                 let cursor_line = self.editor.cursor().row;
-                self.editor.insert("    ");
+                if modifiers.shift {
+                    self.editor.outdent_selections(4);
+                } else {
+                    self.editor.indent_selections(4);
+                }
                 self.status_message.clear();
                 self.auto_scroll = true;
                 self.last_input_time = Instant::now();
@@ -149,14 +153,18 @@ impl GuiApp {
                 }
             }
             egui::Key::ArrowUp => {
-                if modifiers.shift {
+                if modifiers.alt {
+                    self.editor.move_lines_up();
+                } else if modifiers.shift {
                     self.editor.extend_selection_up();
                 } else {
                     self.editor.move_up();
                 }
             }
             egui::Key::ArrowDown => {
-                if modifiers.shift {
+                if modifiers.alt {
+                    self.editor.move_lines_down();
+                } else if modifiers.shift {
                     self.editor.extend_selection_down();
                 } else {
                     self.editor.move_down();
@@ -230,6 +238,10 @@ impl GuiApp {
             }
 
             // ── Ctrl shortcuts ───────────────────────────────────────────────
+            egui::Key::Slash if modifiers.ctrl => {
+                self.editor.toggle_comments();
+            }
+
             egui::Key::A if modifiers.ctrl => {
                 self.editor.select_all();
             }
@@ -247,6 +259,7 @@ impl GuiApp {
                     self.status_message = "Redo".to_string();
                 }
             }
+            
 
             egui::Key::D if modifiers.ctrl => {
                 self.editor.select_next_occurrence();

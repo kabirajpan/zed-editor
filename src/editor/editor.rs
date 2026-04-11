@@ -209,52 +209,69 @@ impl Editor {
 
         let old_buffer = self.buffer().clone();
         
-        // 1. Capture original cursor offsets
-        let cursor_offsets_before: Vec<usize> = self.selections.iter()
-            .map(|s| self.buffer().point_to_offset(s.end).value())
+        // 1. Capture original selection offsets (both start and end)
+        let selection_offsets_before: Vec<(usize, usize)> = self.selections.iter()
+            .map(|s| (
+                self.buffer().point_to_offset(s.start).value(), 
+                self.buffer().point_to_offset(s.end).value()
+            ))
             .collect();
 
-        // 2. Sort edits by offset (ascending for shift calculation)
+        // 2. Sort edits by offset
         edits.sort_unstable_by_key(|e| e.offset.value());
 
-        // 3. Mathematical Cursor Shift Calculation
-        // New_Offset = Old_Offset + NetChange(edits before it)
-        let mut cursor_offsets_after = Vec::new();
-        for &old_off in &cursor_offsets_before {
-            // Check if ANY edit at this position provides a specific cursor target
-            let mut target_override = None;
-            for edit in &edits {
-                if edit.offset.value() == old_off {
-                    if let Some(target) = edit.cursor_offset {
-                        target_override = Some(target);
-                        break;
+        // 3. Mathematical Selection Shift Calculation
+        let mut selection_offsets_after = Vec::new();
+
+        for &(old_start, old_end) in &selection_offsets_before {
+            let is_point_cursor = old_start == old_end;
+
+            // Helper to calculate shift for a specific point
+            let calc_shift = |old_off: usize, is_range_end: bool| -> usize {
+                // Check for explicit override at this position
+                for edit in &edits {
+                    if edit.offset.value() == old_off {
+                        if let Some(target) = edit.cursor_offset {
+                            return target;
+                        }
                     }
                 }
-            }
 
-            if let Some(target) = target_override {
-                cursor_offsets_after.push(target);
-            } else {
                 let mut total_shift: isize = 0;
                 for edit in &edits {
-                    // Shift the cursor if the edit happens before it.
-                    // If the edit happens exactly AT the cursor, only shift if it's an insertion
-                    // (this pushes the cursor forward while typing).
-                    if edit.offset.value() < old_off || (edit.offset.value() == old_off && edit.old_text.is_empty()) {
-                        let delta = edit.new_text.len() as isize - edit.old_text.len() as isize;
+                    let edit_start = edit.offset.value();
+                    let edit_end = edit_start + edit.old_text.len();
+                    let delta = edit.new_text.len() as isize - edit.old_text.len() as isize;
+
+                    if edit_end <= old_off {
+                        // 1. Edit is fully before the point
                         total_shift += delta;
+                    } else if edit_start < old_off {
+                        // 2. Edit OVERLAPS/SWALLOWS the point
+                        // Snap the point to the start of the deletion
+                        total_shift -= (old_off - edit_start) as isize;
+                        // A point can only be swallowed once.
+                        break; 
+                    } else if edit_start == old_off {
+                        // 3. Edit is exactly at the point (Insertion boundary)
+                        if is_point_cursor || (is_range_end && edit.old_text.is_empty()) {
+                            total_shift += delta;
+                        }
                     }
                 }
-                cursor_offsets_after.push((old_off as isize + total_shift) as usize);
-            }
+                (old_off as isize + total_shift) as usize
+            };
+
+            let new_start = calc_shift(old_start, false);
+            let new_end = calc_shift(old_end, true);
+            selection_offsets_after.push((new_start, new_end));
         }
 
-        // 4. Apply edits in REVERSE (highest offset first) to keep current buffer offsets valid
+        // 4. Apply edits in REVERSE
         let current_buf = self.history.current_mut();
         current_buf.invalidate_cache();
         for edit in edits.iter().rev() {
             let end_off = Offset(edit.offset.value() + edit.old_text.len());
-            // Clear old range then insert new
             if edit.old_text.len() > 0 {
                 current_buf.delete(edit.offset, end_off);
             }
@@ -262,7 +279,6 @@ impl Editor {
                 current_buf.insert(edit.offset, &edit.new_text);
             }
 
-            // Sync with renderer
             self.pending_edit_events.push(EditEvent {
                 start_byte: edit.offset.value(),
                 old_end_byte: end_off.value(),
@@ -277,18 +293,21 @@ impl Editor {
 
         // 5. Update selections to their new synchronized positions
         let mut new_selections = Vec::new();
-        for &new_off in &cursor_offsets_after {
-            let point = self.buffer().offset_to_point(Offset(new_off));
-            new_selections.push(Selection::cursor(point));
+        for &(new_start, new_end) in &selection_offsets_after {
+            let start = self.buffer().offset_to_point(Offset(new_start));
+            let end = self.buffer().offset_to_point(Offset(new_end));
+            new_selections.push(Selection::new(start, end));
         }
         self.selections = new_selections;
-        self.normalize_selections();
+        // self.normalize_selections(); // Wait, if I preserve selections, normalise might merge them
+        // For now I'll just sort them to keep multi-cursor happy.
+        self.selections.sort_by_key(|s| s.range().0);
 
-        // 6. Push single TRANSACTION for entire batch
+        // 6. Push TRANSACTION
         let transaction = crate::history::transaction::Transaction::new(
             edits,
-            cursor_offsets_before,
-            cursor_offsets_after,
+            selection_offsets_before.iter().map(|&(s, _)| s).collect(), // History only tracks cursors for now
+            selection_offsets_after.iter().map(|&(s, _)| s).collect(),
         );
         self.history.push(old_buffer, new_buffer, transaction);
 
@@ -297,6 +316,14 @@ impl Editor {
     }
 
     pub fn insert(&mut self, text: &str) {
+        // 🚀 Selection Wrapping
+        if text.len() == 1 && self.has_selection() {
+            if let Some(closer) = self.get_closing_pair(text) {
+                self.wrap_selections(text, closer);
+                return;
+            }
+        }
+
         self.delete_selections();
         self.flush_pending_delete();
         self.flush_pending_insert();
@@ -325,9 +352,9 @@ impl Editor {
                         .slice_bytes(offset.value() - 1, offset.value())
                         .chars()
                         .next()
-                } else {
-                    None
-                };
+                    } else {
+                        None
+                    };
 
                 let is_split = (prev_char == Some('{') && next_char == Some('}')) ||
                                (prev_char == Some('[') && next_char == Some(']')) ||
@@ -345,6 +372,26 @@ impl Editor {
                 } else {
                     format!("\n{}", indent)
                 }
+            } else if text.len() == 1 {
+                // 🚀 Smart Overwrite & Auto-Closing
+                let next_char = self.buffer()
+                    .slice_bytes(offset.value(), (offset.value() + 1).min(self.buffer().len()))
+                    .chars()
+                    .next();
+                
+                let is_closer = text == ")" || text == "]" || text == "}" || text == "\"" || text == "'";
+                
+                if is_closer && next_char == Some(text.chars().next().unwrap()) {
+                    // Smart Overwrite: Just skip the char
+                    cursor_override = Some(offset.value() + 1);
+                    "".to_string()
+                } else if let Some(closer) = self.get_closing_pair(text) {
+                    // Auto-Close: Insert opener+closer and put cursor in between
+                    cursor_override = Some(offset.value() + 1);
+                    format!("{}{}", text, closer)
+                } else {
+                    text.to_string()
+                }
             } else {
                 text.to_string()
             };
@@ -358,6 +405,49 @@ impl Editor {
         }
 
         self.execute_edits(edits);
+    }
+
+    fn get_closing_pair(&self, opener: &str) -> Option<&'static str> {
+        match opener {
+            "(" => Some(")"),
+            "[" => Some("]"),
+            "{" => Some("}"),
+            "\"" => Some("\""),
+            "'" => Some("'"),
+            _ => None,
+        }
+    }
+
+    fn wrap_selections(&mut self, opener: &str, closer: &str) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+
+        let mut edits = Vec::new();
+        // Skip wrapping for empty cursors to avoid duplication bug
+        for selection in &self.selections {
+            if selection.is_empty() { continue; }
+            let (start, end) = selection.range();
+            let s_off = self.buffer().point_to_offset(start);
+            let e_off = self.buffer().point_to_offset(end);
+
+            edits.push(crate::history::transaction::RawEdit {
+                offset: s_off,
+                old_text: String::new(),
+                new_text: opener.to_string(),
+                cursor_offset: None,
+            });
+
+            edits.push(crate::history::transaction::RawEdit {
+                offset: e_off,
+                old_text: String::new(),
+                new_text: closer.to_string(),
+                cursor_offset: None,
+            });
+        }
+
+        if !edits.is_empty() {
+            self.execute_edits(edits);
+        }
     }
 
     /// Paste text into the editor, replacing selection if any.
@@ -396,16 +486,45 @@ impl Editor {
             let cursor = selection.end;
             if cursor == Point::zero() { continue; }
             
-            let before = self.move_point_left(cursor);
-            let s_off = self.buffer().point_to_offset(before);
-            let e_off = self.buffer().point_to_offset(cursor);
-            
-            edits.push(crate::history::transaction::RawEdit {
-                offset: s_off,
-                old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
-                new_text: String::new(),
-                cursor_offset: None,
-            });
+            let offset = self.buffer().point_to_offset(cursor);
+            let prev_char = if offset.value() > 0 {
+                self.buffer().slice_bytes(offset.value() - 1, offset.value()).chars().next()
+            } else {
+                None
+            };
+            let next_char = self.buffer()
+                .slice_bytes(offset.value(), (offset.value() + 1).min(self.buffer().len()))
+                .chars()
+                .next();
+
+            // 🚀 Smart Backspace: If at (|), delete both
+            let is_pair = (prev_char == Some('(') && next_char == Some(')')) ||
+                          (prev_char == Some('[') && next_char == Some(']')) ||
+                          (prev_char == Some('{') && next_char == Some('}')) ||
+                          (prev_char == Some('"') && next_char == Some('"')) ||
+                          (prev_char == Some('\'') && next_char == Some('\''));
+
+            if is_pair {
+                let s_off = Offset(offset.value() - 1);
+                let e_off = Offset(offset.value() + 1);
+                edits.push(crate::history::transaction::RawEdit {
+                    offset: s_off,
+                    old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
+                    new_text: String::new(),
+                    cursor_offset: Some(s_off.value()),
+                });
+            } else {
+                let before = self.move_point_left(cursor);
+                let s_off = self.buffer().point_to_offset(before);
+                let e_off = self.buffer().point_to_offset(cursor);
+                
+                edits.push(crate::history::transaction::RawEdit {
+                    offset: s_off,
+                    old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
+                    new_text: String::new(),
+                    cursor_offset: None,
+                });
+            }
         }
 
         self.execute_edits(edits);
@@ -732,6 +851,10 @@ impl Editor {
             col += 1;
         }
         Point::new(point.row, col)
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selections.iter().any(|s| !s.is_empty())
     }
 
     // -------------------------------------------------------------------------
@@ -1139,6 +1262,322 @@ impl Editor {
                 new_text: String::new(),
                 cursor_offset: None,
             });
+        }
+
+        self.execute_edits(edits);
+    }
+
+    // -------------------------------------------------------------------------
+    // Indentation
+    // -------------------------------------------------------------------------
+
+    pub fn indent_selections(&mut self, indent_width: usize) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+
+        // 1. Identify all unique lines covered by any selection
+        let mut lines_to_indent = std::collections::BTreeSet::new();
+        for selection in &self.selections {
+            let (start, end) = selection.range();
+            for row in start.row..=end.row {
+                lines_to_indent.insert(row);
+            }
+        }
+
+        // 2. Create edits for each line at column 0
+        let mut edits = Vec::new();
+        let indent_str = " ".repeat(indent_width);
+        for &row in &lines_to_indent {
+            let offset = self.buffer().point_to_offset(Point::new(row, 0));
+            edits.push(crate::history::transaction::RawEdit {
+                offset,
+                old_text: String::new(),
+                new_text: indent_str.clone(),
+                cursor_offset: None,
+            });
+        }
+
+        self.execute_edits(edits);
+    }
+
+    pub fn outdent_selections(&mut self, indent_width: usize) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+
+        // 1. Identify all unique lines
+        let mut lines_to_outdent = std::collections::BTreeSet::new();
+        for selection in &self.selections {
+            let (start, end) = selection.range();
+            for row in start.row..=end.row {
+                lines_to_outdent.insert(row);
+            }
+        }
+
+        // 2. For each line, remove up to indent_width spaces/tabs
+        let mut edits = Vec::new();
+        for &row in &lines_to_outdent {
+            if let Some(line) = self.buffer().line(row) {
+                // Find how much leading whitespace we can remove
+                let mut spaces_to_remove = 0;
+                for c in line.chars().take(indent_width) {
+                    if c == ' ' {
+                        spaces_to_remove += 1;
+                    } else if c == '\t' {
+                        // A tab counts as one character in this simple model, 
+                        // but usually it's better to just remove it if it's the first thing.
+                        spaces_to_remove += 1;
+                        break; 
+                    } else {
+                        break;
+                    }
+                }
+
+                if spaces_to_remove > 0 {
+                    let offset = self.buffer().point_to_offset(Point::new(row, 0));
+                    edits.push(crate::history::transaction::RawEdit {
+                        offset,
+                        old_text: line.chars().take(spaces_to_remove).collect(),
+                        new_text: String::new(),
+                        cursor_offset: None,
+                    });
+                }
+            }
+        }
+
+        self.execute_edits(edits);
+    }
+
+    // -------------------------------------------------------------------------
+    // Line Movement
+    // -------------------------------------------------------------------------
+
+    pub fn move_lines_up(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+
+        let mut lines = std::collections::BTreeSet::new();
+        for s in &self.selections {
+            let (start, end) = s.range();
+            for r in start.row..=end.row {
+                lines.insert(r);
+            }
+        }
+        if lines.is_empty() || lines.contains(&0) {
+            return;
+        }
+
+        let blocks = self.group_contiguous_lines(lines);
+        let mut edits = Vec::new();
+
+        for block in &blocks {
+            let start_row = block[0];
+            let end_row = block[block.len() - 1];
+
+            // 1. Get full text of the line above the block (including its newline)
+            let s_off = self.buffer().point_to_offset(Point::new(start_row - 1, 0));
+            let e_off = self.buffer().point_to_offset(Point::new(start_row, 0));
+            let mut prev_line_text = self.buffer().slice_bytes(s_off.value(), e_off.value());
+            
+            // Safety check: ensure it ends with \n if it's being moved down away from the top
+            if !prev_line_text.ends_with('\n') {
+                prev_line_text.push('\n');
+            }
+
+            // 2. Delete line (start_row - 1)
+            edits.push(crate::history::transaction::RawEdit {
+                offset: s_off,
+                old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
+                new_text: String::new(),
+                cursor_offset: None,
+            });
+
+            // 3. Insert it after end_row
+            let target_off = if end_row + 1 < self.buffer().line_count() {
+                self.buffer().point_to_offset(Point::new(end_row + 1, 0))
+            } else {
+                Offset(self.buffer().len())
+            };
+
+            edits.push(crate::history::transaction::RawEdit {
+                offset: target_off,
+                old_text: String::new(),
+                new_text: prev_line_text,
+                cursor_offset: None,
+            });
+        }
+
+        // Shift selections up
+        let mut new_selections = self.selections.clone();
+        for s in &mut new_selections {
+            s.start.row = s.start.row.saturating_sub(1);
+            s.end.row = s.end.row.saturating_sub(1);
+        }
+
+        self.execute_edits(edits);
+        self.selections = new_selections;
+    }
+
+    pub fn move_lines_down(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+
+        let mut lines = std::collections::BTreeSet::new();
+        for s in &self.selections {
+            let (start, end) = s.range();
+            for r in start.row..=end.row {
+                lines.insert(r);
+            }
+        }
+        let line_count = self.buffer().line_count();
+        if lines.is_empty() || lines.contains(&(line_count - 1)) {
+            return;
+        }
+
+        let blocks = self.group_contiguous_lines(lines);
+        let mut edits = Vec::new();
+
+        // Process blocks in reverse order
+        for block in blocks.iter().rev() {
+            let start_row = block[0];
+            let end_row = block[block.len() - 1];
+
+            // 1. Get full text of the line below the block
+            let s_off = self.buffer().point_to_offset(Point::new(end_row + 1, 0));
+            let e_off = if end_row + 2 < line_count {
+                self.buffer().point_to_offset(Point::new(end_row + 2, 0))
+            } else {
+                let last_len = self.buffer().line(end_row + 1).map(|l| l.len()).unwrap_or(0);
+                self.buffer().point_to_offset(Point::new(end_row + 1, last_len))
+            };
+            
+            let mut next_line_text = self.buffer().slice_bytes(s_off.value(), e_off.value());
+            // Ensure next_line_text ends with newline
+            if !next_line_text.ends_with('\n') {
+                next_line_text.push('\n');
+            }
+
+            // 2. Delete line (end_row + 1)
+            edits.push(crate::history::transaction::RawEdit {
+                offset: s_off,
+                old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
+                new_text: String::new(),
+                cursor_offset: None,
+            });
+
+            // 3. Insert it before start_row
+            let target_off = self.buffer().point_to_offset(Point::new(start_row, 0));
+            edits.push(crate::history::transaction::RawEdit {
+                offset: target_off,
+                old_text: String::new(),
+                new_text: next_line_text,
+                cursor_offset: None,
+            });
+        }
+
+        // Shift selections down
+        let mut new_selections = self.selections.clone();
+        for s in &mut new_selections {
+            s.start.row += 1;
+            s.end.row += 1;
+        }
+
+        self.execute_edits(edits);
+        self.selections = new_selections;
+    }
+
+    fn group_contiguous_lines(&self, lines: std::collections::BTreeSet<usize>) -> Vec<Vec<usize>> {
+        let mut groups = Vec::new();
+        let lines_vec: Vec<usize> = lines.into_iter().collect();
+        if lines_vec.is_empty() {
+            return groups;
+        }
+
+        let mut current_group = vec![lines_vec[0]];
+        for i in 1..lines_vec.len() {
+            if lines_vec[i] == lines_vec[i - 1] + 1 {
+                current_group.push(lines_vec[i]);
+            } else {
+                groups.push(current_group);
+                current_group = vec![lines_vec[i]];
+            }
+        }
+        groups.push(current_group);
+        groups
+    }
+
+    // -------------------------------------------------------------------------
+    // Intelligent Editing
+    // -------------------------------------------------------------------------
+
+    pub fn toggle_comments(&mut self) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+
+        // 1. Identify rows to toggle
+        let mut rows = std::collections::BTreeSet::new();
+        for s in &self.selections {
+            let (start, end) = s.range();
+            for r in start.row..=end.row {
+                rows.insert(r);
+            }
+        }
+        if rows.is_empty() {
+            return;
+        }
+
+        // 2. Identify prefix (default to // for Rust/C)
+        let prefix = "// ";
+
+        // 3. Determine if we are commenting or uncommenting
+        // Rule: If any visible line is NOT commented, we comment all.
+        let mut should_comment = false;
+        for &row in &rows {
+            if let Some(line) = self.buffer().line(row) {
+                let trimmed = line.trim_start();
+                if !trimmed.is_empty() && !trimmed.starts_with("//") {
+                    should_comment = true;
+                    break;
+                }
+            }
+        }
+
+        let mut edits = Vec::new();
+
+        for &row in &rows {
+            if let Some(line) = self.buffer().line(row) {
+                let trimmed_start = line.len() - line.trim_start().len();
+                let line_suffix = &line[trimmed_start..];
+
+                if should_comment {
+                    // Comment: Add "// " at the first non-whitespace char
+                    // (But for empty lines, we just leave them alone or comment at col 0)
+                    let offset = self.buffer().point_to_offset(Point::new(row, trimmed_start));
+                    edits.push(crate::history::transaction::RawEdit {
+                        offset,
+                        old_text: String::new(),
+                        new_text: prefix.to_string(),
+                        cursor_offset: None,
+                    });
+                } else {
+                    // Uncomment: Look for // or // 
+                    let mut to_remove = 0;
+                    if line_suffix.starts_with("// ") {
+                        to_remove = 3;
+                    } else if line_suffix.starts_with("//") {
+                        to_remove = 2;
+                    }
+
+                    if to_remove > 0 {
+                        let offset = self.buffer().point_to_offset(Point::new(row, trimmed_start));
+                        edits.push(crate::history::transaction::RawEdit {
+                            offset,
+                            old_text: line_suffix[0..to_remove].to_string(),
+                            new_text: String::new(),
+                            cursor_offset: None,
+                        });
+                    }
+                }
+            }
         }
 
         self.execute_edits(edits);

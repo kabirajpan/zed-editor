@@ -3,7 +3,7 @@ use crate::buffer::{Buffer, Offset, Point};
 use crate::history::{History, Transaction};
 use crate::syntax::IndentCalculator;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct EditEvent {
@@ -36,6 +36,10 @@ pub struct Editor {
 
     last_edit_time: Instant,
     pending_edit_events: Vec<EditEvent>,
+    
+    // 🛡️ Double-Insert Guard
+    last_insert_text: Option<String>,
+    last_insert_time: Instant,
 }
 
 impl Editor {
@@ -55,6 +59,8 @@ impl Editor {
             last_delete_time: Instant::now(),
             last_edit_time: Instant::now(),
             pending_edit_events: Vec::new(),
+            last_insert_text: None,
+            last_insert_time: Instant::now(),
         }
     }
 
@@ -74,6 +80,8 @@ impl Editor {
             last_delete_time: Instant::now(),
             last_edit_time: Instant::now(),
             pending_edit_events: Vec::new(),
+            last_insert_text: None,
+            last_insert_time: Instant::now(),
         }
     }
 
@@ -227,7 +235,7 @@ impl Editor {
             let is_point_cursor = old_start == old_end;
 
             // Helper to calculate shift for a specific point
-            let calc_shift = |old_off: usize, is_range_end: bool| -> usize {
+            let calc_shift = |old_off: usize, is_sticky_right: bool| -> usize {
                 // Check for explicit override at this position
                 for edit in &edits {
                     if edit.offset.value() == old_off {
@@ -243,27 +251,30 @@ impl Editor {
                     let edit_end = edit_start + edit.old_text.len();
                     let delta = edit.new_text.len() as isize - edit.old_text.len() as isize;
 
-                    if edit_end <= old_off {
-                        // 1. Edit is fully before the point
+                    if edit_end < old_off {
+                        // 1. Edit is strictly before the point
                         total_shift += delta;
+                    } else if edit_start == old_off {
+                        // 2. Edit is exactly at the point (Insertion boundary)
+                        if is_sticky_right {
+                            total_shift += delta;
+                        }
                     } else if edit_start < old_off {
-                        // 2. Edit OVERLAPS/SWALLOWS the point
+                        // 3. Edit OVERLAPS/SWALLOWS the point
                         // Snap the point to the start of the deletion
                         total_shift -= (old_off - edit_start) as isize;
                         // A point can only be swallowed once.
                         break; 
-                    } else if edit_start == old_off {
-                        // 3. Edit is exactly at the point (Insertion boundary)
-                        if is_point_cursor || (is_range_end && edit.old_text.is_empty()) {
-                            total_shift += delta;
-                        }
                     }
                 }
-                (old_off as isize + total_shift) as usize
+                (old_off as isize + total_shift).max(0) as usize
             };
 
-            let new_start = calc_shift(old_start, false);
-            let new_end = calc_shift(old_end, true);
+            let _min_off = old_start.min(old_end);
+            let max_off = old_start.max(old_end);
+
+            let new_start = calc_shift(old_start, is_point_cursor || old_start == max_off);
+            let new_end = calc_shift(old_end, is_point_cursor || old_end == max_off);
             selection_offsets_after.push((new_start, new_end));
         }
 
@@ -316,92 +327,115 @@ impl Editor {
     }
 
     pub fn insert(&mut self, text: &str) {
-        // 🚀 Selection Wrapping
-        if text.len() == 1 && self.has_selection() {
-            if let Some(closer) = self.get_closing_pair(text) {
-                self.wrap_selections(text, closer);
+        // 🛡️ Double-Insert Guard: Prevent identical rapid calls (common in GUI event loops)
+        let now = Instant::now();
+        if let Some(last_text) = &self.last_insert_text {
+            if last_text == text && now.duration_since(self.last_insert_time) < Duration::from_millis(10) {
                 return;
             }
         }
+        self.last_insert_text = Some(text.to_string());
+        self.last_insert_time = now;
 
-        self.delete_selections();
-        self.flush_pending_delete();
         self.flush_pending_insert();
+        self.flush_pending_delete();
 
         let mut edits = Vec::new();
+        let opener = if text.chars().count() == 1 { self.get_closing_pair(text) } else { None };
+
         for selection in &self.selections {
-            let cursor = selection.end;
-            let offset = self.buffer().point_to_offset(cursor);
+            let (start_pt, end_pt) = selection.range();
+            let s_off = self.buffer().point_to_offset(start_pt);
+            let e_off = self.buffer().point_to_offset(end_pt);
 
-            let mut cursor_override = None;
-            let text_to_insert = if text == "\n" {
-                let indent = self.indent_calculator.calculate_indent_with_rope(
-                    self.buffer().rope(),
-                    cursor.row,
-                    cursor.column,
-                    self.file_path.as_deref(),
-                );
-
-                // Smart Split: Detect if we are between { } or similar
-                let next_char = self.buffer()
-                    .slice_bytes(offset.value(), (offset.value() + 1).min(self.buffer().len()))
-                    .chars()
-                    .next();
-                let prev_char = if offset.value() > 0 {
-                    self.buffer()
-                        .slice_bytes(offset.value() - 1, offset.value())
-                        .chars()
-                        .next()
-                    } else {
-                        None
-                    };
-
-                let is_split = (prev_char == Some('{') && next_char == Some('}')) ||
-                               (prev_char == Some('[') && next_char == Some(']')) ||
-                               (prev_char == Some('(') && next_char == Some(')'));
-
-                if is_split {
-                    let parent_indent = if let Some(line) = self.buffer().line(cursor.row) {
-                        line.chars().take_while(|c| c.is_whitespace()).collect::<String>()
-                    } else {
-                        String::new()
-                    };
-                    let result = format!("\n{}\n{}", indent, parent_indent);
-                    cursor_override = Some(offset.value() + 1 + indent.len());
-                    result
+            if !selection.is_empty() {
+                // 🚀 CASE 1: Active Selection (Range)
+                if let Some(closer) = opener {
+                    // 1a. Selection Wrapping
+                    edits.push(crate::history::transaction::RawEdit {
+                        offset: s_off,
+                        old_text: String::new(),
+                        new_text: text.to_string(),
+                        cursor_offset: None,
+                    });
+                    edits.push(crate::history::transaction::RawEdit {
+                        offset: e_off,
+                        old_text: String::new(),
+                        new_text: closer.to_string(),
+                        cursor_offset: None,
+                    });
                 } else {
-                    format!("\n{}", indent)
-                }
-            } else if text.len() == 1 {
-                // 🚀 Smart Overwrite & Auto-Closing
-                let next_char = self.buffer()
-                    .slice_bytes(offset.value(), (offset.value() + 1).min(self.buffer().len()))
-                    .chars()
-                    .next();
-                
-                let is_closer = text == ")" || text == "]" || text == "}" || text == "\"" || text == "'";
-                
-                if is_closer && next_char == Some(text.chars().next().unwrap()) {
-                    // Smart Overwrite: Just skip the char
-                    cursor_override = Some(offset.value() + 1);
-                    "".to_string()
-                } else if let Some(closer) = self.get_closing_pair(text) {
-                    // Auto-Close: Insert opener+closer and put cursor in between
-                    cursor_override = Some(offset.value() + 1);
-                    format!("{}{}", text, closer)
-                } else {
-                    text.to_string()
+                    // 1b. Selection Overwrite
+                    edits.push(crate::history::transaction::RawEdit {
+                        offset: s_off,
+                        old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
+                        new_text: text.to_string(),
+                        cursor_offset: None,
+                    });
                 }
             } else {
-                text.to_string()
-            };
+                // 🚀 CASE 2: Point Cursor
+                let offset = s_off;
+                
+                let mut cursor_override = None;
+                let text_to_insert = if text == "\n" {
+                    // Smart Newline
+                    let indent = self.indent_calculator.calculate_indent_with_rope(
+                        self.buffer().rope(),
+                        start_pt.row,
+                        start_pt.column,
+                        self.file_path.as_deref(),
+                    );
 
-            edits.push(crate::history::transaction::RawEdit {
-                offset,
-                old_text: String::new(),
-                new_text: text_to_insert,
-                cursor_offset: cursor_override,
-            });
+                    let next_char = self.buffer()
+                        .slice_bytes(offset.value(), (offset.value() + 1).min(self.buffer().len()))
+                        .chars().next();
+                    let prev_char = if offset.value() > 0 {
+                        self.buffer().slice_bytes(offset.value() - 1, offset.value()).chars().next()
+                    } else { None };
+
+                    let is_split = (prev_char == Some('{') && next_char == Some('}')) ||
+                                   (prev_char == Some('[') && next_char == Some(']')) ||
+                                   (prev_char == Some('(') && next_char == Some(')'));
+
+                    if is_split {
+                        let parent_indent = if let Some(line) = self.buffer().line(start_pt.row) {
+                            line.chars().take_while(|c| c.is_whitespace()).collect::<String>()
+                        } else { String::new() };
+                        let result = format!("\n{}\n{}", indent, parent_indent);
+                        cursor_override = Some(offset.value() + 1 + indent.len());
+                        result
+                    } else {
+                        format!("\n{}", indent)
+                    }
+                } else if text.chars().count() == 1 {
+                    // Smart Overwrite & Auto-Closing
+                    let next_char = self.buffer()
+                        .slice_bytes(offset.value(), (offset.value() + 1).min(self.buffer().len()))
+                        .chars().next();
+                    
+                    let is_closer = text == ")" || text == "]" || text == "}" || text == "\"" || text == "'";
+                    
+                    if is_closer && next_char == Some(text.chars().next().unwrap()) {
+                        cursor_override = Some(offset.value() + 1);
+                        "".to_string()
+                    } else if let Some(closer) = opener {
+                        cursor_override = Some(offset.value() + 1);
+                        format!("{}{}", text, closer)
+                    } else {
+                        text.to_string()
+                    }
+                } else {
+                    text.to_string()
+                };
+
+                edits.push(crate::history::transaction::RawEdit {
+                    offset,
+                    old_text: String::new(),
+                    new_text: text_to_insert,
+                    cursor_offset: cursor_override,
+                });
+            }
         }
 
         self.execute_edits(edits);
@@ -1479,6 +1513,103 @@ impl Editor {
         for s in &mut new_selections {
             s.start.row += 1;
             s.end.row += 1;
+        }
+
+        self.execute_edits(edits);
+        self.selections = new_selections;
+    }
+    pub fn duplicate_lines_up(&mut self) {
+        self.duplicate_lines(true);
+    }
+
+    pub fn duplicate_lines_down(&mut self) {
+        self.duplicate_lines(false);
+    }
+
+    fn duplicate_lines(&mut self, up: bool) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+
+        let mut lines = std::collections::BTreeSet::new();
+        for s in &self.selections {
+            let (start, end) = s.range();
+            for r in start.row..=end.row {
+                lines.insert(r);
+            }
+        }
+        if lines.is_empty() {
+            return;
+        }
+
+        let blocks = self.group_contiguous_lines(lines);
+        let mut edits = Vec::new();
+        let mut row_shifts = std::collections::HashMap::new();
+
+        // Process blocks (blocks are already sorted by group_contiguous_lines)
+        // If duplicating multiple blocks, we process from bottom to top to avoid offset invalidation
+        for block in blocks.iter().rev() {
+            let start_row = block[0];
+            let end_row = block[block.len() - 1];
+            let block_height = block.len();
+
+            // 1. Get text of the block
+            let s_off = self.buffer().point_to_offset(Point::new(start_row, 0));
+            let e_off = if end_row + 1 < self.buffer().line_count() {
+                self.buffer().point_to_offset(Point::new(end_row + 1, 0))
+            } else {
+                let last_len = self.buffer().line(end_row).map(|l| l.len()).unwrap_or(0);
+                self.buffer().point_to_offset(Point::new(end_row, last_len))
+            };
+
+            let mut block_text = self.buffer().slice_bytes(s_off.value(), e_off.value());
+            
+            // 🛡️ Boundary Safety: Ensure the block text ends with a newline if it's the last line
+            if !block_text.ends_with('\n') {
+                block_text.push('\n');
+            }
+
+            if up {
+                // 🚀 DUPLICATE UP: Insert above start_row
+                let target_off = s_off;
+                edits.push(crate::history::transaction::RawEdit {
+                    offset: target_off,
+                    old_text: String::new(),
+                    new_text: block_text,
+                    cursor_offset: None,
+                });
+                // Current selections STAY at the same row (which is now the duplicate)
+            } else {
+                // 🚀 DUPLICATE DOWN: Insert below end_row
+                let target_off = e_off;
+                edits.push(crate::history::transaction::RawEdit {
+                    offset: target_off,
+                    old_text: String::new(),
+                    new_text: block_text,
+                    cursor_offset: None,
+                });
+                // Current selections move to the NEW block (shift DOWN by block_height)
+                for r in start_row..=end_row {
+                    row_shifts.insert(r, block_height as isize);
+                }
+            }
+        }
+
+        // Apply shifts to selections
+        let mut new_selections = self.selections.clone();
+        for s in &mut new_selections {
+            // Check if any row of this selection was part of a duplicate block
+            let (start_p, end_p) = s.range();
+            let (start_r, end_r) = (start_p.row, end_p.row);
+            let mut max_shift = 0;
+            for r in start_r..=end_r {
+                if let Some(&shift) = row_shifts.get(&r) {
+                    max_shift = max_shift.max(shift);
+                }
+            }
+            if max_shift > 0 {
+                s.start.row += max_shift as usize;
+                s.end.row += max_shift as usize;
+            }
         }
 
         self.execute_edits(edits);

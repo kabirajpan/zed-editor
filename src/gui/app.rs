@@ -76,23 +76,7 @@ impl GuiApp {
         }
 
         let cursor_line = self.editor.cursor().row;
-
-        let auto_close = match text {
-            "{" => Some("}"),
-            "[" => Some("]"),
-            "(" => Some(")"),
-            "\"" => Some("\""),
-            "'" => Some("'"),
-            _ => None,
-        };
-
-        if let Some(closing) = auto_close {
-            self.editor.insert(text);
-            self.editor.insert(closing);
-            self.editor.move_left();
-        } else {
-            self.editor.insert(text);
-        }
+        self.editor.insert(text);
 
         self.status_message.clear();
         self.auto_scroll = true;
@@ -153,7 +137,9 @@ impl GuiApp {
                 }
             }
             egui::Key::ArrowUp => {
-                if modifiers.alt {
+                if modifiers.alt && modifiers.shift {
+                    self.editor.duplicate_lines_up();
+                } else if modifiers.alt {
                     self.editor.move_lines_up();
                 } else if modifiers.shift {
                     self.editor.extend_selection_up();
@@ -162,7 +148,9 @@ impl GuiApp {
                 }
             }
             egui::Key::ArrowDown => {
-                if modifiers.alt {
+                if modifiers.alt && modifiers.shift {
+                    self.editor.duplicate_lines_down();
+                } else if modifiers.alt {
                     self.editor.move_lines_down();
                 } else if modifiers.shift {
                     self.editor.extend_selection_down();
@@ -529,11 +517,10 @@ impl eframe::App for GuiApp {
             self.handle_key(egui::Key::Tab, egui::Modifiers::SHIFT, ctx);
         }
 
-        // ── Main input event loop ─────────────────────────────────────────────
         let mut paste_text: Option<String> = None;
         let mut do_copy = false;
         let mut do_cut = false;
-
+        let mut keys_to_handle: Vec<(egui::Key, egui::Modifiers)> = Vec::new();
         ctx.input(|i| {
             if !i.events.is_empty() {
                 self.last_input_time = Instant::now();
@@ -542,62 +529,29 @@ impl eframe::App for GuiApp {
             for event in &i.events {
                 match event {
                     egui::Event::Text(text) => {
-                        self.handle_text_input(text);
+                        // 🛡️ Filter out control characters that shouldn't come through Text events
+                        // (Tab and Enter are handled via Event::Key)
+                        if text != "\t" && text != "\r" && text != "\n" {
+                            self.handle_text_input(text);
+                        }
                     }
                     egui::Event::Paste(text) => {
                         paste_text = Some(text.clone());
                     }
                     egui::Event::Copy => {
-                        // Only copy if we haven't already handled it this frame
                         do_copy = true;
                     }
                     egui::Event::Cut => {
                         do_cut = true;
                     }
-                    egui::Event::WindowFocused(focused) => {
-                        if !focused {
-                            self.manager.clipboard.invalidate_internal();
-                        }
-                    }
-                    egui::Event::Key {
-                        key,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => {
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => {
                         if *key != egui::Key::Tab {
-                            // Clone ctx reference to pass in
-                            // (we handle it below outside the closure)
-                            let _ = (key, modifiers);
+                            keys_to_handle.push((*key, *modifiers));
                         }
                     }
                     _ => {}
                 }
             }
-        });
-
-        // Handle key events outside the borrow
-        let keys_to_handle: Vec<(egui::Key, egui::Modifiers)> = ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|e| {
-                    if let egui::Event::Key {
-                        key,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } = e
-                    {
-                        if *key != egui::Key::Tab {
-                            Some((*key, *modifiers))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
-                .collect()
         });
 
         for (key, modifiers) in keys_to_handle {

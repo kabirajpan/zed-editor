@@ -22,6 +22,7 @@ pub struct LanguageConfig {
     pub extensions: &'static [&'static str],
     pub indent_query: &'static str,
     pub highlight_query: &'static str,
+    pub line_comment: &'static str,
 }
 
 impl LanguageConfig {
@@ -33,6 +34,7 @@ impl LanguageConfig {
             extensions: &["rs"],
             indent_query: include_str!("queries/rust/indents.scm"),
             highlight_query: include_str!("queries/rust/highlights.scm"),
+            line_comment: "//",
         }
     }
 
@@ -44,6 +46,7 @@ impl LanguageConfig {
             extensions: &["js", "jsx", "mjs"],
             indent_query: include_str!("queries/javascript/indents.scm"),
             highlight_query: include_str!("queries/javascript/highlights.scm"),
+            line_comment: "//",
         }
     }
 
@@ -55,6 +58,7 @@ impl LanguageConfig {
             extensions: &["py"],
             indent_query: include_str!("queries/python/indents.scm"),
             highlight_query: include_str!("queries/python/highlights.scm"),
+            line_comment: "#",
         }
     }
 }

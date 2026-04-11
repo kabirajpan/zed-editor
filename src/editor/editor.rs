@@ -1660,8 +1660,9 @@ impl Editor {
             return;
         }
 
-        // 2. Identify prefix (default to // for Rust/C)
-        let prefix = "// ";
+        // 2. Identify prefix from language (default to //)
+        let comment_prefix = self.indent_calculator.get_comment_prefix(self.file_path.as_deref());
+        let prefix_with_space = format!("{} ", comment_prefix);
 
         // 3. Determine if we are commenting or uncommenting
         // Rule: If any visible line is NOT commented, we comment all.
@@ -1669,7 +1670,7 @@ impl Editor {
         for &row in &rows {
             if let Some(line) = self.buffer().line(row) {
                 let trimmed = line.trim_start();
-                if !trimmed.is_empty() && !trimmed.starts_with("//") {
+                if !trimmed.is_empty() && !trimmed.starts_with(comment_prefix) {
                     should_comment = true;
                     break;
                 }
@@ -1684,22 +1685,21 @@ impl Editor {
                 let line_suffix = &line[trimmed_start..];
 
                 if should_comment {
-                    // Comment: Add "// " at the first non-whitespace char
-                    // (But for empty lines, we just leave them alone or comment at col 0)
+                    // Comment: Add "TOKEN " at the first non-whitespace char
                     let offset = self.buffer().point_to_offset(Point::new(row, trimmed_start));
                     edits.push(crate::history::transaction::RawEdit {
                         offset,
                         old_text: String::new(),
-                        new_text: prefix.to_string(),
+                        new_text: prefix_with_space.clone(),
                         cursor_offset: None,
                     });
                 } else {
-                    // Uncomment: Look for // or // 
+                    // Uncomment: Look for "TOKEN " or "TOKEN"
                     let mut to_remove = 0;
-                    if line_suffix.starts_with("// ") {
-                        to_remove = 3;
-                    } else if line_suffix.starts_with("//") {
-                        to_remove = 2;
+                    if line_suffix.starts_with(&prefix_with_space) {
+                        to_remove = prefix_with_space.len();
+                    } else if line_suffix.starts_with(comment_prefix) {
+                        to_remove = comment_prefix.len();
                     }
 
                     if to_remove > 0 {

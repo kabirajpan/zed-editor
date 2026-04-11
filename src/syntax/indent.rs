@@ -16,6 +16,13 @@ impl IndentCalculator {
         }
     }
 
+    pub fn get_comment_prefix(&self, file_path: Option<&Path>) -> &str {
+        file_path
+            .and_then(|path| self.registry.detect_language(path))
+            .map(|lang| lang.line_comment)
+            .unwrap_or("//")
+    }
+
     /// Legacy string-based API (kept for compatibility)
     pub fn calculate_indent(
         &self,

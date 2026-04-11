@@ -1,4 +1,11 @@
-use crate::buffer::Point; // Remove Offset
+use crate::buffer::Point;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMode {
+    Character,
+    Word,
+    Line,
+}
 
 /// Text selection (range)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

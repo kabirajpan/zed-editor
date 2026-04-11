@@ -1,4 +1,4 @@
-use crate::editor::selection::Selection;
+use crate::editor::selection::{Selection, SelectionMode};
 use crate::formatter::providers::{PrettierProvider, RustfmtProvider};
 use crate::io::write_file_from_rope;
 use crate::{read_file, Editor, Formatter, SyntaxHighlighter, SyntaxTheme};
@@ -18,7 +18,6 @@ enum LoadingState {
 
 pub struct GuiApp {
     editor: Editor,
-    cursor_blink: bool,
     last_blink: Instant,
     last_input_time: Instant,
     status_message: String,
@@ -27,12 +26,14 @@ pub struct GuiApp {
     loading_state: LoadingState,
     renderer: ViewportRenderer,
     formatter: Formatter,
+    selection_mode: SelectionMode,
+    selection_anchor: Option<crate::buffer::Point>,
 
     manager: GlobalManager,
 
-    // Click tracking for triple-click detection
+    // Multi-click detection
     last_click_time: Instant,
-    click_count: u8,
+    click_count: u32,
 
     // Pending actions to be handled after the event loop
     pending_copy: bool,
@@ -51,7 +52,6 @@ impl GuiApp {
 
         Self {
             editor: Editor::new(),
-            cursor_blink: true,
             last_blink: Instant::now(),
             last_input_time: Instant::now(),
             status_message: String::new(),
@@ -60,11 +60,13 @@ impl GuiApp {
             loading_state: LoadingState::Idle,
             renderer,
             formatter,
+            selection_mode: SelectionMode::Character,
+            selection_anchor: None,
             manager: GlobalManager::new(),
-            last_click_time: Instant::now(),
-            click_count: 0,
             pending_copy: false,
             pending_cut: false,
+            last_click_time: Instant::now(),
+            click_count: 0,
         }
     }
 
@@ -95,7 +97,6 @@ impl GuiApp {
         self.status_message.clear();
         self.auto_scroll = true;
         self.last_input_time = Instant::now();
-        self.cursor_blink = true;
         self.renderer.invalidate_from_line(cursor_line);
     }
 
@@ -111,7 +112,6 @@ impl GuiApp {
                 self.status_message.clear();
                 self.auto_scroll = true;
                 self.last_input_time = Instant::now();
-                self.cursor_blink = true;
                 self.renderer.invalidate_from_line(cursor_line);
             }
             return;
@@ -310,7 +310,7 @@ impl GuiApp {
             return;
         }
         self.do_copy(ctx);
-        self.editor.delete_selection();
+        self.editor.delete_selections();
         self.status_message.clear();
     }
 
@@ -341,7 +341,6 @@ impl GuiApp {
         self.status_message.clear();
         self.auto_scroll = true;
         self.last_input_time = Instant::now();
-        self.cursor_blink = true;
         self.renderer.invalidate_from_line(refresh_row);
     }
 
@@ -482,14 +481,15 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ── Cursor blink ──────────────────────────────────────────────────────
-        let is_typing = self.last_input_time.elapsed().as_millis() < 800;
-        if !is_typing && self.last_blink.elapsed().as_millis() > 500 {
-            self.cursor_blink = !self.cursor_blink;
-            self.last_blink = Instant::now();
-        } else if is_typing {
-            self.cursor_blink = true;
-        }
+        // ── Cursor alpha calculation ──────────────────────────────────────
+        let elapsed = self.last_input_time.elapsed().as_millis();
+        let cursor_alpha = if elapsed < 3000 {
+            1.0 // Keep cursor solid for 3 seconds of interaction
+        } else {
+            // Start blinking after 3 seconds: toggle between 1.0 and 0.3
+            let blink_phase = (ctx.input(|i| i.time * 2.0).floor() as i64 % 2) == 0;
+            if blink_phase { 1.0 } else { 0.3 }
+        };
         ctx.request_repaint();
 
 
@@ -517,6 +517,10 @@ impl eframe::App for GuiApp {
         let mut do_cut = false;
 
         ctx.input(|i| {
+            if !i.events.is_empty() {
+                self.last_input_time = Instant::now();
+            }
+
             for event in &i.events {
                 match event {
                     egui::Event::Text(text) => {
@@ -681,12 +685,15 @@ impl eframe::App for GuiApp {
         // ── Status bar ────────────────────────────────────────────────────────
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             let cursor = self.editor.cursor();
-            let selection = self.editor.selection();
+            let selections = self.editor.selections();
+            let primary_selection = self.editor.selection();
+            
             let status = if !self.status_message.is_empty() {
                 self.status_message.clone()
-            } else if !selection.is_empty() {
-                let (start, end) = selection.range();
-                // Count selected chars
+            } else if selections.len() > 1 {
+                format!("{} cursors", selections.len())
+            } else if !primary_selection.is_empty() {
+                let (start, end) = primary_selection.range();
                 let selected = self.editor.selected_text().unwrap_or_default();
                 let char_count = selected.chars().count();
                 format!(
@@ -734,54 +741,75 @@ impl eframe::App for GuiApp {
             let interaction = self.renderer.render_with_highlighting(
                 ui,
                 &self.editor,
-                self.cursor_blink,
+                cursor_alpha,
                 self.auto_scroll,
             );
+
+            if ui.rect_contains_pointer(ui.max_rect()) {
+                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Text);
+            }
             self.auto_scroll = false;
 
-            // ── Click handling ────────────────────────────────────────────
-            if let Some(pos) = interaction.double_clicked_at {
-                // Register double click
-                let point = self.renderer.screen_to_point(pos, &self.editor);
-                self.editor.set_cursor(point);
-                self.editor.select_word_at_cursor();
-                self.click_count = 2;
-                self.last_click_time = Instant::now();
-                self.auto_scroll = false;
-            } else if let Some(pos) = interaction.single_clicked_at {
+            // ── Click & Press handling ────────────────────────────────────
+            
+            // 1. Immediate response on Mouse Down (Press)
+            if let Some(pos) = interaction.pressed_at {
+                let point = self.renderer.screen_to_point(ui, pos, &self.editor);
+                self.last_input_time = Instant::now();
+                
+                // Multi-click detection (0.4s threshold)
                 let now = Instant::now();
-                let elapsed = now.duration_since(self.last_click_time).as_millis();
-
-                if self.click_count >= 2 && elapsed < 500 {
-                    // Triple click
-                    let point = self.renderer.screen_to_point(pos, &self.editor);
-                    self.editor.set_cursor(point);
-                    self.editor.select_line_at_cursor();
-                    self.click_count = 0;
+                if now.duration_since(self.last_click_time).as_secs_f32() < 0.4 {
+                    self.click_count = (self.click_count + 1).min(3);
                 } else {
-                    // Single click — place cursor, clear selection
-                    let point = self.renderer.screen_to_point(pos, &self.editor);
-                    self.editor.set_cursor(point);
                     self.click_count = 1;
                 }
                 self.last_click_time = now;
+
+                self.selection_anchor = Some(point);
+                
+                match self.click_count {
+                    1 => {
+                        self.selection_mode = SelectionMode::Character;
+                        if ui.input(|i| i.modifiers.alt) {
+                            self.editor.add_selection(point);
+                        } else {
+                            self.editor.set_cursor(point);
+                        }
+                    }
+                    2 => {
+                        self.selection_mode = SelectionMode::Word;
+                        self.editor.set_cursor(point);
+                        self.editor.select_word_at_cursor();
+                    }
+                    3 => {
+                        self.selection_mode = SelectionMode::Line;
+                        self.editor.set_cursor(point);
+                        self.editor.select_line_at_cursor();
+                    }
+                    _ => {}
+                }
                 self.auto_scroll = false;
             }
 
             // ── Drag selection ────────────────────────────────────────────
             if interaction.drag_started {
                 if let Some(pos) = interaction.dragging_at {
-                    let point = self.renderer.screen_to_point(pos, &self.editor);
-                    self.editor.set_cursor(point);
-                    self.auto_scroll = false;
+                    let point = self.renderer.screen_to_point(ui, pos, &self.editor);
+                    // On new drag start, if no anchor, set it
+                    if self.selection_anchor.is_none() {
+                        self.selection_anchor = Some(point);
+                        self.selection_mode = SelectionMode::Character;
+                    }
                 }
+                self.auto_scroll = false;
             } else if let Some(pos) = interaction.dragging_at {
                 // Extend selection while dragging
-                let drag_point = self.renderer.screen_to_point(pos, &self.editor);
-                let anchor = self.editor.selection().start;
-                self.editor
-                    .set_selection(crate::editor::selection::Selection::new(anchor, drag_point));
-                self.auto_scroll = false;
+                if let Some(anchor) = self.selection_anchor {
+                    let drag_point = self.renderer.screen_to_point(ui, pos, &self.editor);
+                    self.editor.set_selection_with_mode(anchor, drag_point, self.selection_mode);
+                    self.auto_scroll = false;
+                }
             }
         });
     }

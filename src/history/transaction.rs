@@ -1,48 +1,32 @@
-use crate::buffer::Point;
+use crate::buffer::{Point, Offset};
 
-/// A single edit operation
+/// A single atomic edit in the document
 #[derive(Debug, Clone)]
-pub enum EditKind {
-    Insert { text: String },
-    Delete { text: String },
-    Replace { old_text: String, new_text: String },
+pub struct RawEdit {
+    pub offset: Offset,
+    pub old_text: String,
+    pub new_text: String,
+    pub cursor_offset: Option<usize>, // Absolute byte offset after all edits
 }
 
-/// A transaction represents a group of edits
+/// A transaction represents a group of edits across multiple cursors
 #[derive(Debug, Clone)]
 pub struct Transaction {
-    pub cursor_before: Point,
-    pub cursor_after: Point,
-    pub edit: EditKind,
+    pub edits: Vec<RawEdit>,
+    pub cursor_offsets_before: Vec<usize>,
+    pub cursor_offsets_after: Vec<usize>,
 }
 
 impl Transaction {
-    pub fn insert(text: String, cursor_before: Point, cursor_after: Point) -> Self {
-        Self {
-            cursor_before,
-            cursor_after,
-            edit: EditKind::Insert { text },
-        }
-    }
-
-    pub fn delete(text: String, cursor_before: Point, cursor_after: Point) -> Self {
-        Self {
-            cursor_before,
-            cursor_after,
-            edit: EditKind::Delete { text },
-        }
-    }
-
-    pub fn replace(
-        old_text: String,
-        new_text: String,
-        cursor_before: Point,
-        cursor_after: Point,
+    pub fn new(
+        edits: Vec<RawEdit>,
+        cursor_offsets_before: Vec<usize>,
+        cursor_offsets_after: Vec<usize>,
     ) -> Self {
         Self {
-            cursor_before,
-            cursor_after,
-            edit: EditKind::Replace { old_text, new_text },
+            edits,
+            cursor_offsets_before,
+            cursor_offsets_after,
         }
     }
 }

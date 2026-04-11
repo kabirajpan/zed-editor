@@ -155,7 +155,7 @@ impl ViewportRenderer {
         self.frame_count += 1;
 
         let cursor = editor.cursor();
-        let selection = editor.selection();
+        let _selection = editor.selection();
         let current_version = editor.version();
         let font_id = FontId::monospace(14.0);
         let line_height = ui.fonts(|f| f.row_height(&font_id)) + 4.0;

@@ -21,19 +21,20 @@ impl IndentCalculator {
         &self,
         text: &str,
         cursor_line: usize,
+        cursor_column: usize,
         file_path: Option<&Path>,
     ) -> String {
         let Some(path) = file_path else {
-            return self.fallback_indent(text, cursor_line);
+            return self.fallback_indent(text, cursor_line, cursor_column);
         };
         let Some(lang_config) = self.registry.detect_language(path) else {
-            return self.fallback_indent(text, cursor_line);
+            return self.fallback_indent(text, cursor_line, cursor_column);
         };
         let mut parser = self.registry.create_parser(lang_config);
         let Some(tree) = parser.parse(text, None) else {
-            return self.fallback_indent(text, cursor_line);
+            return self.fallback_indent(text, cursor_line, cursor_column);
         };
-        self.query_based_indent(text, cursor_line, &tree, lang_config)
+        self.query_based_indent(text, cursor_line, cursor_column, &tree, lang_config)
     }
 
     /// Called on every newline — uses a context window for performance
@@ -41,13 +42,14 @@ impl IndentCalculator {
         &self,
         rope: &crate::rope::Rope,
         cursor_line: usize,
+        cursor_column: usize,
         file_path: Option<&Path>,
     ) -> String {
         let Some(path) = file_path else {
-            return self.fallback_indent_with_rope(rope, cursor_line);
+            return self.fallback_indent_with_rope(rope, cursor_line, cursor_column);
         };
         let Some(lang_config) = self.registry.detect_language(path) else {
-            return self.fallback_indent_with_rope(rope, cursor_line);
+            return self.fallback_indent_with_rope(rope, cursor_line, cursor_column);
         };
 
         // Only parse a context window, not the entire file
@@ -65,11 +67,11 @@ impl IndentCalculator {
         let context_text = rope.slice_bytes(context_start_byte, context_end_byte);
         let mut parser = self.registry.create_parser(lang_config);
         let Some(tree) = parser.parse(&context_text, None) else {
-            return self.fallback_indent_with_rope(rope, cursor_line);
+            return self.fallback_indent_with_rope(rope, cursor_line, cursor_column);
         };
 
         let line_in_context = cursor_line - context_start_line;
-        self.query_based_indent(&context_text, line_in_context, &tree, lang_config)
+        self.query_based_indent(&context_text, line_in_context, cursor_column, &tree, lang_config)
     }
 
     /// Core logic: use the indents.scm query to determine indent level
@@ -77,6 +79,7 @@ impl IndentCalculator {
         &self,
         text: &str,
         cursor_line: usize,
+        cursor_column: usize,
         tree: &Tree,
         config: &LanguageConfig,
     ) -> String {
@@ -87,26 +90,26 @@ impl IndentCalculator {
         }
 
         let current_line = lines[cursor_line];
-        let current_indent = Self::get_line_indent(current_line);
+        let _current_indent = Self::get_line_indent(current_line);
 
         // Build the query from the language's indents.scm
         let query = match Query::new(&config.language, config.indent_query) {
             Ok(q) => q,
-            Err(_) => return self.fallback_indent(text, cursor_line),
+            Err(_) => return self.fallback_indent(text, cursor_line, cursor_column),
         };
 
         let indent_capture_idx = match query.capture_index_for_name("indent") {
             Some(idx) => idx,
-            None => return self.fallback_indent(text, cursor_line),
+            None => return self.fallback_indent(text, cursor_line, cursor_column),
         };
 
-        // Byte offset at the end of the current line (where cursor sits after typing)
-        let cursor_byte: usize = lines
+        // Byte offset at the cursor position
+        let previous_lines_bytes: usize = lines
             .iter()
-            .take(cursor_line + 1)
-            .map(|l| l.len() + 1) // +1 for newline
-            .sum::<usize>()
-            .saturating_sub(1);
+            .take(cursor_line)
+            .map(|l| l.len() + 1)
+            .sum();
+        let cursor_byte = previous_lines_bytes + cursor_column;
 
         // Walk all query matches and find the deepest @indent node
         // that contains the cursor position
@@ -128,7 +131,7 @@ impl IndentCalculator {
                 let node_end = node.end_byte();
 
                 // Only consider nodes that contain the cursor
-                if node_start > cursor_byte || cursor_byte >= node_end {
+                if node_start > cursor_byte || cursor_byte > node_end {
                     continue;
                 }
 
@@ -159,8 +162,8 @@ impl IndentCalculator {
             }
         }
 
-        // No @indent node found — preserve current indentation
-        current_indent
+        // No @indent node found — fall back to character-based heuristics
+        self.fallback_indent(text, cursor_line, cursor_column)
     }
 
     fn get_line_indent(line: &str) -> String {
@@ -169,10 +172,23 @@ impl IndentCalculator {
             .collect()
     }
 
-    fn fallback_indent_with_rope(&self, rope: &crate::rope::Rope, cursor_line: usize) -> String {
+    fn fallback_indent_with_rope(
+        &self,
+        rope: &crate::rope::Rope,
+        cursor_line: usize,
+        cursor_column: usize,
+    ) -> String {
         if let Some(line_text) = rope.line(cursor_line) {
-            let trimmed = line_text.trim();
             let indent = Self::get_line_indent(&line_text);
+            
+            // Look at text up to the cursor
+            let text_to_check = if cursor_column < line_text.len() {
+                &line_text[..cursor_column]
+            } else {
+                &line_text
+            };
+            
+            let trimmed = text_to_check.trim();
             if trimmed.ends_with('{')
                 || trimmed.ends_with('[')
                 || trimmed.ends_with('(')
@@ -187,14 +203,21 @@ impl IndentCalculator {
         }
     }
 
-    fn fallback_indent(&self, text: &str, cursor_line: usize) -> String {
+    fn fallback_indent(&self, text: &str, cursor_line: usize, cursor_column: usize) -> String {
         let lines: Vec<&str> = text.lines().collect();
         if cursor_line >= lines.len() {
             return String::new();
         }
         let current_line = lines[cursor_line];
         let indent = Self::get_line_indent(current_line);
-        let trimmed = current_line.trim();
+        
+        let text_to_check = if cursor_column < current_line.len() {
+            &current_line[..cursor_column]
+        } else {
+            current_line
+        };
+        
+        let trimmed = text_to_check.trim();
         if trimmed.ends_with('{')
             || trimmed.ends_with('[')
             || trimmed.ends_with('(')

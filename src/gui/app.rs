@@ -248,6 +248,11 @@ impl GuiApp {
                 }
             }
 
+            egui::Key::D if modifiers.ctrl => {
+                self.editor.select_next_occurrence();
+                self.auto_scroll = true;
+            }
+
             egui::Key::K if modifiers.ctrl && modifiers.shift => {
                 // Ctrl+Shift+K — delete line (VS Code)
                 self.editor.delete_line();

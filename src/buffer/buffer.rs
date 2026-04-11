@@ -194,6 +194,11 @@ impl Buffer {
         &self.rope
     }
 
+    /// 🚀 Invalidate all cached line offsets
+    pub fn invalidate_cache(&mut self) {
+        self.line_cache.invalidate_all();
+    }
+
     /// 🚀 Get cache statistics for performance monitoring
     pub fn cache_stats(&self) -> String {
         let stats = self.line_cache.cache_stats();

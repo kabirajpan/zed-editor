@@ -23,6 +23,10 @@ impl History {
         &self.current
     }
 
+    pub fn current_mut(&mut self) -> &mut Buffer {
+        Arc::make_mut(&mut self.current)
+    }
+
     /// Update current buffer without saving to undo stack.
     /// Used for live batched edits — we update the buffer incrementally,
     /// then commit the whole batch to history via push() when the word is done.

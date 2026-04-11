@@ -236,9 +236,12 @@ impl Editor {
 
             // Helper to calculate shift for a specific point
             let calc_shift = |old_off: usize, is_sticky_right: bool| -> usize {
-                // Check for explicit override at this position
+                // Check for explicit override at this position (or if the point is swallowed by a replacement)
                 for edit in &edits {
-                    if edit.offset.value() == old_off {
+                    let edit_start = edit.offset.value();
+                    let edit_end = edit_start + edit.old_text.len();
+                    
+                    if old_off >= edit_start && old_off <= edit_end {
                         if let Some(target) = edit.cursor_offset {
                             return target;
                         }
@@ -370,7 +373,8 @@ impl Editor {
                         offset: s_off,
                         old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
                         new_text: text.to_string(),
-                        cursor_offset: None,
+                        // 🛡️ Selection Replace: Move cursor to the END of the replacement
+                        cursor_offset: Some(s_off.value() + text.len()),
                     });
                 }
             } else {

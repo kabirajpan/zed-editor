@@ -1683,30 +1683,35 @@ impl Editor {
         self.flush_pending_insert();
         self.flush_pending_delete();
 
-        // 1. Identify all unique lines covered by any selection
-        let mut lines_to_indent = std::collections::BTreeSet::new();
-        for selection in &self.selections {
-            let (start, end) = selection.range();
-            for row in start.row..=end.row {
-                lines_to_indent.insert(row);
-            }
-        }
-
-        // 2. Create edits for each line at column 0
-        let mut edits = Vec::new();
+        let has_any_selection = self.selections.iter().any(|s| !s.is_empty());
         let indent_str = " ".repeat(indent_width);
-        for &row in &lines_to_indent {
-            let offset = self.buffer().point_to_offset(Point::new(row, 0));
-            edits.push(crate::history::transaction::RawEdit {
-                offset,
-                old_text: String::new(),
-                new_text: indent_str.clone(),
-                cursor_offset: None,
-                author: crate::history::transaction::Author::Human,
-            });
-        }
 
-        self.execute_edits(edits);
+        if !has_any_selection {
+            // Case A: No selection -> Insert spaces at each cursor position
+            self.insert(&indent_str);
+        } else {
+            // Case B: Block selection -> Indent the start of every affected line
+            let mut lines_to_indent = std::collections::BTreeSet::new();
+            for selection in &self.selections {
+                let (start, end) = selection.range();
+                for row in start.row..=end.row {
+                    lines_to_indent.insert(row);
+                }
+            }
+
+            let mut edits = Vec::new();
+            for &row in &lines_to_indent {
+                let offset = self.buffer().point_to_offset(Point::new(row, 0));
+                edits.push(crate::history::transaction::RawEdit {
+                    offset,
+                    old_text: String::new(),
+                    new_text: indent_str.clone(),
+                    cursor_offset: None,
+                    author: crate::history::transaction::Author::Human,
+                });
+            }
+            self.execute_edits(edits);
+        }
     }
 
     pub fn outdent_selections(&mut self, indent_width: usize) {

@@ -4,6 +4,7 @@ use crate::io::write_file_from_rope;
 use crate::{read_file, Editor, Formatter, SyntaxHighlighter, SyntaxTheme};
 use std::path::PathBuf;
 use std::time::Instant;
+use tokio::sync::mpsc;
 
 use crate::manager::{FocusTarget, GlobalManager};
 use super::viewport_renderer::ViewportRenderer;
@@ -14,6 +15,14 @@ enum LoadingState {
     Loading { progress: f32, message: String },
     Complete,
     Error(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct NepHint {
+    pub text: String,
+    pub anchor: crate::buffer::Point,
+    pub version: u64,
+    pub line_count: usize,
 }
 
 
@@ -58,10 +67,23 @@ pub struct GuiApp {
     ai_stream_index: usize,
     ai_stream_timer: f32,
     
-    // Real AI Provider (for inline completions)
+    // Real AI Provider (for inline completions & NEP)
     ai_provider_type: crate::ai::provider::ProviderType,
     ai_api_key: String,
     ai_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    
+    // NEP: Next Edit Prediction
+    current_nep_hint: Option<NepHint>,
+    nep_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<NepHint>>,
+    nep_loading: bool,
+    nep_start_time: Option<Instant>,
+    
+    // 🔱 Layer 3: Mason & LSP logic
+    pub mason: crate::ai::mason::MasonManager,
+    pub lsp_install_prompt: Option<String>,
+    pub skipped_lsps: Vec<String>,
+    pub mason_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<crate::ai::mason::MasonEvent>>,
+    pub mason_sender: tokio::sync::mpsc::UnboundedSender<crate::ai::mason::MasonEvent>,
 
     // Layer 1.1: Proper Hardening
     last_pie_sync: Instant,
@@ -83,6 +105,7 @@ impl GuiApp {
         let mut renderer = ViewportRenderer::new();
         renderer.highlighter = highlighter;
 
+        let (m_tx, m_rx) = mpsc::unbounded_channel();
         Self {
             editor: Editor::new(),
             last_blink: Instant::now(),
@@ -107,6 +130,15 @@ impl GuiApp {
             ai_provider_type: crate::ai::provider::ProviderType::Anthropic,
             ai_api_key: String::new(),
             ai_receiver: None,
+            current_nep_hint: None,
+            nep_receiver: None,
+            nep_loading: false,
+            nep_start_time: None,
+            mason: crate::ai::mason::MasonManager::new(),
+            lsp_install_prompt: None,
+            skipped_lsps: Vec::new(),
+            mason_receiver: Some(m_rx),
+            mason_sender: m_tx,
             last_pie_sync: Instant::now(),
             panel_manager: crate::gui::panels::PanelManager::new(),
             ai_permissions: AiPermissionPool::none(),
@@ -128,9 +160,11 @@ impl GuiApp {
     }
 
     fn handle_key(&mut self, key: egui::Key, modifiers: egui::Modifiers, _ctx: &egui::Context) {
-        // ── Tab (focus cycling or indent) ────────────────────────────────────
+        // ── Tab (focus cycling OR editor indent) ──────────────────────────────
         if key == egui::Key::Tab {
-            if self.manager.focus.handle_tab(modifiers.shift, &self.manager.panels) {
+            // 🔱 Strict Buffer Focus: Tab is ONLY for the Editor.
+            // Default focus navigation (panel cycling) is disabled to prevent "global tab" leaks.
+            if !self.manager.focus.is_focused(FocusTarget::Editor) {
                 return;
             }
             // ── Save / Sync PIE (Ctrl+S) ──────────────────────────────────────────
@@ -569,6 +603,23 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut tab_pressed = false;
+        let mut shift_tab_pressed = false;
+
+        // 🔱 User-Docs Pattern: Use consume_shortcut to reliably hijack Tab/Shift+Tab.
+        // This prevents egui from performing global focus navigation.
+        let tab_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Tab);
+        let shift_tab_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Tab);
+
+        ctx.input_mut(|i| {
+            if i.consume_shortcut(&tab_shortcut) {
+                tab_pressed = true;
+            }
+            if i.consume_shortcut(&shift_tab_shortcut) {
+                shift_tab_pressed = true;
+            }
+        });
+
         // ── Cursor alpha calculation ──────────────────────────────────────
         let elapsed = self.last_input_time.elapsed().as_millis();
         let cursor_alpha = if elapsed < 3000 {
@@ -589,6 +640,95 @@ impl eframe::App for GuiApp {
             }
         }
 
+        
+        // 🔱 Mason Event Handling
+        if let Some(ref mut rx) = self.mason_receiver {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    crate::ai::mason::MasonEvent::Progress(name, p) => {
+                        self.mason.set_status(&name, crate::ai::mason::LspServiceStatus::Downloading(p));
+                    }
+                    crate::ai::mason::MasonEvent::Complete(name) => {
+                        self.mason.set_status(&name, crate::ai::mason::LspServiceStatus::Installed);
+                        self.status_message = format!("✅ {} installed successfully!", name);
+                    }
+                    crate::ai::mason::MasonEvent::Error(name, err) => {
+                        self.mason.set_status(&name, crate::ai::mason::LspServiceStatus::Error(err));
+                    }
+                }
+            }
+        }
+
+        // 🔱 NEP Stall Recovery & Receiver
+        if self.nep_loading {
+            if let Some(start) = self.nep_start_time {
+                if start.elapsed().as_secs_f32() > 5.0 {
+                    self.nep_loading = false;
+                    self.status_message = "⚠️ NEP request timed out. Resetting...".to_string();
+                }
+            }
+        }
+
+        if let Some(ref mut rx) = self.nep_receiver {
+            while let Ok(mut hint) = rx.try_recv() {
+                if hint.version == self.editor.version() {
+                    // 🔱 Layer 2: Stitching Logic (Remove duplicate prefixes) - Longest Overlap Detection
+                    let last_line = self.editor.buffer().line(hint.anchor.row).unwrap_or_default();
+                    let prefix_segment = last_line[..hint.anchor.column.min(last_line.len())].to_string();
+                    
+                    if !prefix_segment.trim().is_empty() {
+                        let overlap_len = find_longest_overlap(&prefix_segment, &hint.text);
+                        if overlap_len > 0 {
+                            hint.text = hint.text[overlap_len..].to_string();
+                        }
+                    }
+
+                    self.current_nep_hint = Some(hint);
+                    self.nep_loading = false;
+                    self.nep_start_time = None;
+                }
+            }
+        }
+
+        // 🔱 NEP Stale Check: Clear hint if version changed or cursor moved
+        if let Some(hint) = &self.current_nep_hint {
+            if hint.version != self.editor.version() || hint.anchor != self.editor.cursor() {
+                self.current_nep_hint = None;
+            }
+        }
+        
+        // 🔱 NEP Idle Trigger: If no hint and idle for 1.5s
+        if self.current_nep_hint.is_none() 
+            && !self.nep_loading 
+            && !self.ai_api_key.is_empty() 
+            && self.last_input_time.elapsed().as_secs_f32() > 1.5 
+            && !self.editor.is_speculative_active() 
+        {
+            self.trigger_nep();
+        }
+
+        // 🔱 Layer 3: LSP Auto-Detection Logic
+        if let Some(file) = &self.current_file {
+            if let Some(ext_str) = file.extension().and_then(|e| e.to_str()) {
+                let mut target_lsp = None;
+                for (name, ext_cfg) in &self.mason.registry {
+                    if ext_cfg.supported_extensions.contains(&ext_str.to_string()) {
+                        target_lsp = Some(name.clone());
+                        break;
+                    }
+                }
+
+                if let Some(lsp_name) = target_lsp {
+                    if self.mason.get_status(&lsp_name) == crate::ai::mason::LspServiceStatus::NotInstalled 
+                        && !self.skipped_lsps.contains(&lsp_name) 
+                        && self.lsp_install_prompt.is_none() 
+                    {
+                        self.lsp_install_prompt = Some(lsp_name);
+                    }
+                }
+            }
+        }
+
         // ── Real AI Token Handling (Layer 2: Speculative Transaction) ────────
         if let Some(ref mut rx) = self.ai_receiver {
             while let Ok(token) = rx.try_recv() {
@@ -604,21 +744,13 @@ impl eframe::App for GuiApp {
 
 
         let mut enter_pressed_speculative = false;
-        let mut tab_pressed = false;
-        let mut shift_tab_pressed = false;
+        
         ctx.input_mut(|i| {
-            // Only consume Tab if AI is "offering" something
-            if self.editor.is_speculative_active() || self.editor.ai_ghost_text.is_some() {
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
-                    tab_pressed = true;
-                }
-                if i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab) {
-                    shift_tab_pressed = true;
-                }
-            }
-
             if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
-                if self.editor.is_speculative_active() {
+                if self.current_nep_hint.is_some() {
+                    self.current_nep_hint = None;
+                    self.status_message = "NEP Prediction dismissed.".to_string();
+                } else if self.editor.is_speculative_active() {
                     self.editor.rollback_speculative();
                     self.status_message = "AI suggestion rolled back.".to_string();
                 } else if self.editor.ai_ghost_text.is_some() {
@@ -646,7 +778,13 @@ impl eframe::App for GuiApp {
         }
 
         if tab_pressed {
-            if self.editor.is_speculative_active() {
+            if let Some(hint) = self.current_nep_hint.take() {
+                if hint.version == self.editor.version() {
+                    self.editor.insert(&hint.text);
+                    self.status_message = "✨ NEP Prediction applied.".to_string();
+                    self.last_input_time = Instant::now();
+                }
+            } else if self.editor.is_speculative_active() {
                 self.editor.commit_speculative();
                 self.status_message = "✨ AI changes committed.".to_string();
             } else if self.editor.ai_ghost_text.is_some() {
@@ -837,6 +975,8 @@ impl eframe::App for GuiApp {
             self.renderer.highlighter.tree(),
             &mut self.manager,
             &mut self.ai_permissions,
+            &mut self.mason,
+            &self.mason_sender,
         );
 
         // ── Status bar ────────────────────────────────────────────────────────
@@ -923,6 +1063,7 @@ impl eframe::App for GuiApp {
                 &self.editor,
                 cursor_alpha,
                 self.auto_scroll,
+                self.current_nep_hint.as_ref(), // 🔱 Pass NEP Hint
             );
 
             self.auto_scroll = false;
@@ -953,6 +1094,30 @@ impl eframe::App for GuiApp {
                                     }
                                 });
                             });
+                    });
+            }
+
+            // ── LSP Install Prompt Overlay ────────────────────────────────
+            if let Some(lsp_name) = self.lsp_install_prompt.clone() {
+                egui::Window::new("📥 Missing LSP Tool")
+                    .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -100.0])
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        ui.label(format!("Z3N detected you are working with a new file type. Would you like to install [{}] for instant, local intelligence?", lsp_name));
+                        ui.horizontal(|ui| {
+                            if ui.button(egui::RichText::new("✅ Install Now").strong()).clicked() {
+                                if let Some(ext) = self.mason.registry.get_mut(&lsp_name) {
+                                    ext.status = crate::ai::mason::LspServiceStatus::Downloading(0.0);
+                                    self.mason.trigger_install(lsp_name.clone(), self.mason_sender.clone());
+                                }
+                                self.lsp_install_prompt = None;
+                            }
+                            if ui.button("❌ Skip for now").clicked() {
+                                self.skipped_lsps.push(lsp_name);
+                                self.lsp_install_prompt = None;
+                            }
+                        });
                     });
             }
 
@@ -1044,6 +1209,43 @@ impl eframe::App for GuiApp {
     }
 }
 
+/// 🔱 Layer 2: Suffix-Prefix Overlap Detection
+/// Finds the longest suffix of 'prefix' that is also a prefix of 'suggestion'.
+fn find_longest_overlap(prefix: &str, suggestion: &str) -> usize {
+    let prefix = prefix.trim_end();
+    let suggestion = suggestion.trim_start();
+    
+    if prefix.is_empty() || suggestion.is_empty() {
+        return 0;
+    }
+
+    let mut overlap = 0;
+    let max_possible = prefix.len().min(suggestion.len());
+
+    for len in (1..=max_possible).rev() {
+        let prefix_suffix = &prefix[prefix.len() - len..];
+        let suggestion_prefix = &suggestion[..len];
+        if prefix_suffix == suggestion_prefix {
+            overlap = len;
+            break;
+        }
+    }
+
+    // Secondary Check: If the suggestion starts with the prefix exactly (case insensitive / trimmed)
+    if overlap == 0 {
+        let p_trim = prefix.trim();
+        let s_trim = suggestion.trim();
+        if s_trim.starts_with(p_trim) && !p_trim.is_empty() {
+            // Find where p_trim ends in the original suggestion
+            if let Some(pos) = suggestion.find(p_trim) {
+                return pos + p_trim.len();
+            }
+        }
+    }
+
+    overlap
+}
+
 impl GuiApp {
     fn start_ai_simulation(&mut self) {
         if self.ai_stream_active { return; }
@@ -1098,6 +1300,89 @@ impl GuiApp {
             
             self.start_real_ai_stream(prefix, suffix);
         }
+    }
+
+    fn trigger_nep(&mut self) {
+        if self.ai_api_key.is_empty() { return; }
+        self.nep_loading = true;
+        self.nep_start_time = Some(Instant::now());
+        
+        let cursor = self.editor.cursor();
+        let offset = self.editor.buffer().point_to_offset(cursor).value();
+        let text = self.editor.buffer().to_string();
+        let version = self.editor.version();
+        
+        // Split context
+        let (prefix, suffix) = text.split_at(offset);
+        let prefix = prefix.to_string();
+        let suffix = suffix.to_string();
+        
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.nep_receiver = Some(rx);
+        
+        let provider_type = self.ai_provider_type;
+        let api_key = self.ai_api_key.clone();
+        
+        let extension = self.current_file.as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .unwrap_or("unknown");
+
+        // 🔱 Layer 2: Strict Language Mapping
+        let lang_name = match extension {
+            "rs" => "Rust",
+            "js" => "JavaScript",
+            "ts" => "TypeScript",
+            "py" => "Python",
+            "c" => "C",
+            "cpp" => "C++",
+            "md" => "Markdown",
+            "html" => "HTML",
+            "css" => "CSS",
+            _ => "Text"
+        };
+
+        let system_prompt = format!(
+            "You are a Next Edit Prediction (NEP) engine inside the Z3N Editor. \n\
+             Your goal is to predict the code that follows the current cursor position in a {} file.\n\n\
+             CRITICAL RULES:\n\
+             1. Output ONLY the code to be appended. NO triple backticks. NO explanations.\n\
+             2. DO NOT repeat the code already provided in the prefix. If the prefix ends with 'fn main()', your code should start with ' {{\\n    ...'.\n\
+             3. Maintain strict indentation matching the prefix.\n\
+             4. START EXACTLY at the cursor. If the cursor is at the end of a line, start with a newline if appropriate.",
+            lang_name
+        );
+        
+        let user_prompt = format!("### PREFIX\n{}\n### CURSOR\n### SUFFIX\n{}", prefix, suffix);
+
+        tokio::spawn(async move {
+            let provider: Box<dyn crate::ai::provider::ModelProvider> = match provider_type {
+                crate::ai::provider::ProviderType::Anthropic => Box::new(crate::ai::provider::AnthropicProvider),
+                crate::ai::provider::ProviderType::Ollama => Box::new(crate::ai::provider::OllamaProvider),
+                crate::ai::provider::ProviderType::Grok => Box::new(crate::ai::provider::GrokProvider),
+                crate::ai::provider::ProviderType::Groq => Box::new(crate::ai::provider::GroqProvider),
+            };
+            
+            let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel();
+            provider.stream_completion(system_prompt, user_prompt, api_key, inner_tx);
+            
+            let mut full_text = String::new();
+            while let Some(token) = inner_rx.recv().await {
+                full_text.push_str(&token);
+                // 🔱 Layer 2 Optimization: Cap NEP hints at 500 chars for multi-line snippets
+                if full_text.len() > 500 { break; }
+            }
+
+            if !full_text.trim().is_empty() {
+                let line_count = full_text.lines().count().max(1);
+                let _ = tx.send(NepHint {
+                    text: full_text,
+                    anchor: cursor,
+                    version,
+                    line_count,
+                });
+            }
+        });
     }
 
     fn start_real_ai_stream(&mut self, prefix: &str, suffix: &str) {

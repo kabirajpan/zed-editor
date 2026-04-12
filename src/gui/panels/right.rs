@@ -10,6 +10,7 @@ use crate::manager::{FocusTarget, GlobalManager};
 pub enum RightPanelTab {
     Chat,
     Investigator,
+    Extensions,
 }
 
 pub struct RightPanel {
@@ -40,6 +41,8 @@ impl RightPanel {
         viewport_tree: Option<&tree_sitter::Tree>,
         manager: &mut GlobalManager,
         permissions: &mut crate::gui::app::AiPermissionPool,
+        mason: &mut crate::ai::mason::MasonManager,
+        mason_sender: &tokio::sync::mpsc::UnboundedSender<crate::ai::mason::MasonEvent>,
     ) {
         if !self.is_visible {
             return;
@@ -68,14 +71,15 @@ impl RightPanel {
                 ui.add_space(4.0);
 
                 // ── 100% Width Tab Bar ──────────────────────────────────────────
-                let tabs = [RightPanelTab::Chat, RightPanelTab::Investigator];
+                let tabs = [RightPanelTab::Chat, RightPanelTab::Investigator, RightPanelTab::Extensions];
                 let num_tabs = tabs.len();
                 
                 ui.columns(num_tabs, |cols| {
                     for (i, tab) in tabs.iter().enumerate() {
                         let label = match tab {
                             RightPanelTab::Chat => "🤖 Chat",
-                            RightPanelTab::Investigator => "🔍 Investigator",
+                            RightPanelTab::Investigator => "🔍 PIE",
+                            RightPanelTab::Extensions => "🧩 Extensions",
                         };
                         
                         let is_selected = self.active_tab == *tab;
@@ -94,6 +98,7 @@ impl RightPanel {
                 match self.active_tab {
                     RightPanelTab::Chat => self.render_chat_tab(ui, editor, provider_type, api_key, manager, permissions, viewport_tree),
                     RightPanelTab::Investigator => self.render_investigator_tab(ui, editor, viewport_tree, provider_type, api_key),
+                    RightPanelTab::Extensions => crate::gui::panels::extensions_panel::ExtensionsPanel::render(ui, mason, mason_sender),
                 }
             });
     }

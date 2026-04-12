@@ -1,10 +1,12 @@
 
 pub mod right;
+pub mod extensions_panel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelTab {
     Chat,
     Investigator,
+    Extensions,
     FileTree,
     Terminal,
 }

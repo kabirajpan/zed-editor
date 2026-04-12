@@ -48,6 +48,10 @@ pub struct ViewportRenderer {
     char_width: f32,        // monospace char width, measured once
     line_number_width: f32, // always 50.0
     scroll_offset: Vec2,    // horizontal/vertical scroll from viewport
+    
+    // 🔱 Layer 2: Virtual Shifting state for screen_to_point
+    last_virtual_expansion: f32,
+    last_hint_row: Option<usize>,
 }
 
 impl ViewportRenderer {
@@ -63,6 +67,8 @@ impl ViewportRenderer {
             char_width: 8.4,
             line_number_width: 50.0,
             scroll_offset: Vec2::ZERO,
+            last_virtual_expansion: 0.0,
+            last_hint_row: None,
         }
     }
 
@@ -98,7 +104,17 @@ impl ViewportRenderer {
     /// Convert a screen position (from pointer events) to a buffer Point.
     /// Uses the layout stored during the last render call.
     pub fn screen_to_point(&mut self, ui: &egui::Ui, screen_pos: Pos2, editor: &crate::Editor) -> Point {
-        let rel_y = screen_pos.y - self.content_rect.min.y;
+        let mut rel_y = screen_pos.y - self.content_rect.min.y;
+
+        // 🔱 Layer 2: Inverse Virtual Shifting
+        if let Some(h_row) = self.last_hint_row {
+            let hint_y = h_row as f32 * self.line_height;
+            // If we are below the hint, subtract the expansion to find the real buffer row
+            if rel_y > hint_y + self.line_height {
+                 rel_y = (rel_y - self.last_virtual_expansion).max(hint_y + self.line_height);
+            }
+        }
+
         let row = (rel_y / self.line_height).floor() as usize;
         let row = row.min(editor.line_count().saturating_sub(1));
 
@@ -155,6 +171,7 @@ impl ViewportRenderer {
         editor: &crate::Editor,
         cursor_alpha: f32,
         should_auto_scroll: bool,
+        nep_hint: Option<&crate::gui::app::NepHint>,
     ) -> RenderInteraction {
         self.frame_count += 1;
 
@@ -198,11 +215,26 @@ impl ViewportRenderer {
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
                 let total_lines = editor.line_count().max(1);
-                let content_height = total_lines as f32 * line_height;
+                
+                // 🔱 Layer 2: Virtual Expansion for Multi-Line NEP
+                let mut virtual_height_expansion = 0.0;
+                let mut hint_row = None;
+                if let Some(hint) = nep_hint {
+                    if hint.version == editor.version() {
+                        virtual_height_expansion = (hint.line_count - 1) as f32 * line_height;
+                        hint_row = Some(hint.anchor.row);
+                    }
+                }
 
+                self.last_virtual_expansion = virtual_height_expansion;
+                self.last_hint_row = hint_row;
+
+                let content_height = (total_lines as f32 * line_height) + virtual_height_expansion;
+
+                // Simple visible range calculation (could be more precise but this works for single-hint)
                 let visible_start = (viewport.min.y / line_height).floor().max(0.0) as usize;
                 let visible_end =
-                    ((viewport.max.y / line_height).ceil() as usize + 1).min(total_lines);
+                    (((viewport.max.y + virtual_height_expansion.abs()) / line_height).ceil() as usize + 1).min(total_lines);
 
                 self.last_viewport = (visible_start, visible_end);
 
@@ -249,7 +281,14 @@ impl ViewportRenderer {
                 let primary_cursor = editor.cursor(); // For active line highlighting and line numbers
 
                 for row in visible_start..visible_end {
-                    let y = response.rect.min.y + row as f32 * line_height;
+                    // 🔱 Layer 2: Virtual Shifting
+                    let mut y = response.rect.min.y + row as f32 * line_height;
+                    if let Some(h_row) = hint_row {
+                        if row > h_row {
+                            y += virtual_height_expansion;
+                        }
+                    }
+
                     let line = self.get_line_cached(editor, row, current_version);
                     let highlights = highlights_map.get(&row).cloned().unwrap_or_default();
 
@@ -279,6 +318,22 @@ impl ViewportRenderer {
                         line_num_color,
                     );
 
+                    // 🔱 Layer 2: Ghost Line Numbers for Virtual Expansion
+                    if let Some(h_row) = hint_row {
+                        if row == h_row {
+                            let hint_virtual_lines = (virtual_height_expansion / line_height) as usize;
+                            for i in 1..=hint_virtual_lines {
+                                painter.text(
+                                    Pos2::new(response.rect.min.x + 10.0, y + i as f32 * line_height),
+                                    egui::Align2::LEFT_TOP,
+                                    "  + ".to_string(),
+                                    font_id.clone(),
+                                    Color32::from_rgb(80, 120, 80), // Faded green for ghost numbers
+                                );
+                            }
+                        }
+                    }
+
                     // ── Create Galley with Layer 2: Ghost Text Support ──────
                     let mut job = LayoutJob::default();
                     let line_start_val = editor.buffer().point_to_offset(crate::buffer::Point::new(row, 0)).value();
@@ -290,9 +345,45 @@ impl ViewportRenderer {
                         Vec::new()
                     };
 
+                    // 🔱 NEP Anchor Check
+                    let mut nep_hint_content: Option<&String> = None;
+                    let mut nep_column = 0;
+                    if let Some(hint) = nep_hint {
+                        if hint.anchor.row == row && hint.version == editor.version() {
+                            nep_hint_content = Some(&hint.text);
+                            nep_column = hint.anchor.column;
+                        }
+                    }
+
+                    // Helper to append text and potentially inject NEP hint
+                    let mut current_col = 0;
+                    let mut append_text = |job: &mut LayoutJob, text: &str, format: TextFormat| {
+                        let text_len = text.chars().count();
+                        if let Some(h_text) = nep_hint_content {
+                            if current_col <= nep_column && current_col + text_len >= nep_column {
+                                // Split text at nep_column
+                                let split_idx = nep_column - current_col;
+                                let head: String = text.chars().take(split_idx).collect();
+                                let tail: String = text.chars().skip(split_idx).collect();
+                                
+                                job.append(&head, 0.0, format.clone());
+                                // Inject NEP Hint
+                                let ghost_format = TextFormat::simple(font_id.clone(), Color32::from_gray(120));
+                                job.append(h_text, 0.0, ghost_format);
+                                job.append(&tail, 0.0, format);
+                                nep_hint_content = None; // Only inject once
+                            } else {
+                                job.append(text, 0.0, format);
+                            }
+                        } else {
+                            job.append(text, 0.0, format);
+                        }
+                        current_col += text_len;
+                    };
+
                     if highlights.is_empty() {
                         if authorship.is_empty() {
-                            job.append(&line, 0.0, TextFormat::simple(font_id.clone(), Color32::WHITE));
+                            append_text(&mut job, &line, TextFormat::simple(font_id.clone(), Color32::WHITE));
                         } else {
                             for span in &authorship {
                                 let start_rel = span.offset.saturating_sub(line_start_val);
@@ -304,21 +395,19 @@ impl ViewportRenderer {
                                     format.color = Color32::from_rgb(120, 120, 120);
                                     format.italics = true;
                                 }
-                                job.append(text_slice, 0.0, format);
+                                append_text(&mut job, text_slice, format);
                             }
                         }
                     } else {
-                        // Pass 2: Merging Syntax Highlights with Ghost Provenance
                         let mut last_end = 0;
                         for &(start, end, color) in &highlights {
                             if last_end < start {
                                 let text_slice = &line[last_end..start.min(line.len())];
-                                job.append(text_slice, 0.0, TextFormat::simple(font_id.clone(), Color32::WHITE));
+                                append_text(&mut job, text_slice, TextFormat::simple(font_id.clone(), Color32::WHITE));
                             }
                             
                             let span_end = end.min(line.len());
                             if start < span_end {
-                                // Efficient check: Is this syntax span currently pending AI approval?
                                 let is_ghost = authorship.iter().any(|p_span| {
                                     let abs_start = line_start_val + start;
                                     p_span.author == crate::history::transaction::Author::AiPending && abs_start >= p_span.offset && abs_start < p_span.end()
@@ -330,14 +419,20 @@ impl ViewportRenderer {
                                     format.italics = true;
                                 }
                                 let text_slice = &line[start..span_end];
-                                job.append(text_slice, 0.0, format);
+                                append_text(&mut job, text_slice, format);
                             }
                             last_end = span_end;
                         }
                         if last_end < line.len() {
                             let text_slice = &line[last_end..];
-                            job.append(text_slice, 0.0, TextFormat::simple(font_id.clone(), Color32::WHITE));
+                            append_text(&mut job, text_slice, TextFormat::simple(font_id.clone(), Color32::WHITE));
                         }
+                    }
+
+                    // Fallback: If NEP hint wasn't injected (e.g. anchor column is beyond line end)
+                    if let Some(h_text) = nep_hint_content {
+                        let ghost_format = TextFormat::simple(font_id.clone(), Color32::from_gray(120));
+                        job.append(h_text, 0.0, ghost_format);
                     }
                     
                     let galley = ui.fonts(|f| f.layout_job(job));
@@ -450,7 +545,7 @@ impl ViewportRenderer {
         cursor_alpha: f32,
         should_auto_scroll: bool,
     ) -> RenderInteraction {
-        self.render_with_highlighting(ui, editor, cursor_alpha, should_auto_scroll)
+        self.render_with_highlighting(ui, editor, cursor_alpha, should_auto_scroll, None)
     }
 }
 

@@ -95,22 +95,16 @@ impl History {
     /// Walks backwards through history and translates coordinates to find the origin.
     pub fn author_at(&self, mut offset: usize) -> Option<(&Transaction, crate::history::transaction::Author)> {
         for (_, transaction) in self.undo_stack.iter().rev() {
-            // We need to see if this transaction was the "birth" of the byte at 'offset'
-            // Edits within a transaction are simultaneous, but we can treat them as ordered reverse for coordinate shift.
-            let mut sorted_edits = transaction.edits.clone();
-            sorted_edits.sort_unstable_by_key(|e| e.offset.value());
-
-            for edit in sorted_edits.iter().rev() {
+            // Edits are now pre-sorted in Transaction::new
+            for edit in transaction.edits.iter().rev() {
                 let edit_start = edit.offset.value();
                 let edit_len = edit.new_text.len();
                 let old_len = edit.old_text.len();
 
                 if offset >= edit_start && offset < edit_start + edit_len {
-                    // Match found: This specific edit in this transaction created this byte!
                     return Some((transaction, edit.author));
                 }
 
-                // Coordinate translation: where was this offset BEFORE this edit?
                 if offset >= edit_start + edit_len {
                     offset = (offset as isize - (edit_len as isize - old_len as isize)) as usize;
                 }
@@ -119,8 +113,98 @@ impl History {
         None
     }
 
+    /// 🚀 NEW: Optimized Range Lookup for Layer 2.
+    /// Returns a list of (start_offset, end_offset, Author) spans within the given range.
+    /// This is significantly faster than querying every character.
+    pub fn authorship_spans(&self, start: usize, end: usize) -> Vec<(usize, usize, crate::history::transaction::Author)> {
+        let mut spans = Vec::new();
+        if start >= end { return spans; }
+        
+        let mut current_unclaimed = vec![(start, end)];
+        
+        for (_, transaction) in self.undo_stack.iter().rev() {
+            if current_unclaimed.is_empty() { break; }
+            
+            let mut next_unclaimed = Vec::new();
+            
+            for (u_start, u_end) in current_unclaimed {
+                let mut attributed_in_this_range = false;
+                
+                // Since transaction.edits are sorted, we can be efficient (though here we just iterate for simplicity)
+                for edit in transaction.edits.iter().rev() {
+                    let edit_start = edit.offset.value();
+                    let edit_len = edit.new_text.len();
+                    
+                    let e_start = edit_start;
+                    let e_end = edit_start + edit_len;
+                    
+                    // Intersection of unclaimed range [u_start, u_end] and edit range [e_start, e_end]
+                    let i_start = u_start.max(e_start);
+                    let i_end = u_end.min(e_end);
+                    
+                    if i_start < i_end {
+                        spans.push((i_start, i_end, edit.author));
+                        
+                        // Split the unclaimed range
+                        if u_start < i_start {
+                            next_unclaimed.push((u_start, i_start));
+                        }
+                        if u_end > i_end {
+                            next_unclaimed.push((i_end, u_end));
+                        }
+                        attributed_in_this_range = true;
+                        break; 
+                    }
+                }
+                
+                if !attributed_in_this_range {
+                    // No edit in this transaction touched this range.
+                    // Translate entire range back in time.
+                    let mut shifted_start = u_start;
+                    let mut shifted_end = u_end;
+                    
+                    for edit in transaction.edits.iter().rev() {
+                        let edit_start = edit.offset.value();
+                        let edit_len = edit.new_text.len();
+                        let old_len = edit.old_text.len();
+                        let delta = edit_len as isize - old_len as isize;
+                        
+                        if shifted_start >= edit_start + edit_len {
+                            shifted_start = (shifted_start as isize - delta) as usize;
+                        }
+                        if shifted_end >= edit_start + edit_len {
+                            shifted_end = (shifted_end as isize - delta) as usize;
+                        }
+                    }
+                    next_unclaimed.push((shifted_start, shifted_end));
+                }
+            }
+            current_unclaimed = next_unclaimed;
+        }
+        
+        // Anything remaining is Human
+        for (u_start, u_end) in current_unclaimed {
+            spans.push((u_start, u_end, crate::history::transaction::Author::Human));
+        }
+        
+        spans.sort_by_key(|s| s.0);
+        spans
+    }
+
     /// Expose current Arc<Buffer> so editor can push it to redo stack directly.
     pub fn current_arc(&self) -> Arc<Buffer> {
         self.current.clone()
+    }
+
+    pub fn undo_stack_len(&self) -> usize {
+        self.undo_stack.len()
+    }
+
+    pub fn get_transaction_mut(&mut self, index: usize) -> &mut Transaction {
+        &mut self.undo_stack[index].1
+    }
+
+    pub fn pop_redo(&mut self) -> Option<(Arc<Buffer>, Transaction)> {
+        self.redo_stack.pop()
     }
 }

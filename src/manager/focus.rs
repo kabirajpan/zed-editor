@@ -1,20 +1,20 @@
 /// Focus management and panel state for the Zed Text Editor.
-///
-/// Moved to the manager layer to allow shared access across different UI components.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FocusTarget {
     Editor,
-    Terminal,
-    FileTree,
+    LeftPanel,   // File Tree, etc.
+    RightPanel,  // Chat, Investigator, etc.
+    BottomPanel, // Terminal, Logs, etc.
     SearchBar,
 }
 
 impl FocusTarget {
     fn cycle_order(active_panels: &ActivePanels) -> Vec<FocusTarget> {
         let mut order = vec![FocusTarget::Editor];
-        if active_panels.terminal_open { order.push(FocusTarget::Terminal); }
-        if active_panels.file_tree_open { order.push(FocusTarget::FileTree); }
+        if active_panels.left_open { order.push(FocusTarget::LeftPanel); }
+        if active_panels.right_open { order.push(FocusTarget::RightPanel); }
+        if active_panels.bottom_open { order.push(FocusTarget::BottomPanel); }
         if active_panels.search_bar_open { order.push(FocusTarget::SearchBar); }
         order
     }
@@ -22,8 +22,9 @@ impl FocusTarget {
     pub fn label(&self) -> &'static str {
         match self {
             FocusTarget::Editor => "Editor",
-            FocusTarget::Terminal => "Terminal",
-            FocusTarget::FileTree => "File Tree",
+            FocusTarget::LeftPanel => "Side Bar (Left)",
+            FocusTarget::RightPanel => "Intelligence (Right)",
+            FocusTarget::BottomPanel => "Status (Bottom)",
             FocusTarget::SearchBar => "Search",
         }
     }
@@ -31,8 +32,9 @@ impl FocusTarget {
 
 #[derive(Debug, Clone, Default)]
 pub struct ActivePanels {
-    pub terminal_open: bool,
-    pub file_tree_open: bool,
+    pub left_open: bool,
+    pub right_open: bool,
+    pub bottom_open: bool,
     pub search_bar_open: bool,
 }
 
@@ -75,8 +77,7 @@ impl FocusManager {
     }
 
     pub fn on_key_pressed(&mut self) {
-        // Keep indicator visible while navigating with keyboard;
-        // hide it on first "real" keystroke so it doesn't clutter editing
+        // Hide indicator on first real keystroke
     }
 }
 

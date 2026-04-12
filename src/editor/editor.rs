@@ -38,6 +38,8 @@ pub struct Editor {
     last_edit_time: Instant,
     pending_edit_events: Vec<EditEvent>,
     
+    pub ai_ghost_text: Option<String>,
+
     // 🛡️ Double-Insert Guard
     last_insert_text: Option<String>,
     last_insert_time: Instant,
@@ -49,6 +51,12 @@ pub struct Editor {
     // ── Layer 1.3: PIE (Positional Integrity Encoding) ───────────────────────
     pub delta_generator: DeltaGenerator,
     pub last_semantic_deltas: Vec<SemanticDelta>,
+
+    // ── Layer 2: Speculative Transactions ────────────────────────────────────
+    pub speculative_transaction_active: bool,
+
+    // 🌳 Layer 2.5: Live Provenance Map (Spatial Markers)
+    pub provenance_map: crate::history::transaction::ProvenanceMap,
 }
 
 impl Editor {
@@ -61,19 +69,22 @@ impl Editor {
             file_path: None,
             pending_insert: String::new(),
             pending_start_cursor: None,
-            pending_start_buffer: None,
+            pending_start_buffer: Option::from(Box::new(Buffer::new())),
             pending_delete: String::new(),
             pending_delete_cursor_before: None,
             pending_delete_start_buffer: None,
             last_delete_time: Instant::now(),
             last_edit_time: Instant::now(),
             pending_edit_events: Vec::new(),
+            ai_ghost_text: None,
             last_insert_text: None,
             last_insert_time: Instant::now(),
             is_streaming: false,
             streaming_start_buffer: None,
             delta_generator: DeltaGenerator::new(),
             last_semantic_deltas: Vec::new(),
+            speculative_transaction_active: false,
+            provenance_map: crate::history::transaction::ProvenanceMap::new(),
         }
     }
 
@@ -93,12 +104,17 @@ impl Editor {
             last_delete_time: Instant::now(),
             last_edit_time: Instant::now(),
             pending_edit_events: Vec::new(),
+            ai_ghost_text: None,
             last_insert_text: None,
             last_insert_time: Instant::now(),
             is_streaming: false,
             streaming_start_buffer: None,
             delta_generator: DeltaGenerator::new(),
             last_semantic_deltas: Vec::new(),
+            speculative_transaction_active: false,
+            provenance_map: crate::history::transaction::ProvenanceMap {
+                spans: vec![crate::history::transaction::ProvenanceSpan::new(0, text.len(), crate::history::transaction::Author::Human)],
+            },
         }
     }
 
@@ -186,6 +202,138 @@ impl Editor {
 
     pub fn selections(&self) -> &[Selection] {
         &self.selections
+    }
+
+    pub fn load_file(&mut self, text: String, path: Option<std::path::PathBuf>) {
+        self.file_path = path;
+        self.history = crate::history::History::new(crate::buffer::Buffer::from_text(&text));
+        self.selections = vec![Selection::cursor(Point::zero())];
+        self.version += 1;
+        self.ai_ghost_text = None;
+        self.last_insert_text = None;
+        self.last_edit_time = Instant::now();
+        
+        // Reset PIE state for new buffer
+        self.last_semantic_deltas = Vec::new();
+    }
+
+    /// Agentic Primitive: Updates the current AI suggestion (Ghost Text)
+    pub fn update_ai_ghost_text(&mut self, text: String) {
+        self.ai_ghost_text = Some(text);
+        self.version += 1; // Trigger re-render
+    }
+
+    /// Agentic Primitive: Appends a token to the current AI ghost text (streaming)
+    pub fn append_ai_ghost_text(&mut self, token: &str) {
+        if let Some(ref mut ghost) = self.ai_ghost_text {
+            ghost.push_str(token);
+        } else {
+            self.ai_ghost_text = Some(token.to_string());
+        }
+        self.version += 1;
+    }
+
+    /// Agentic Primitive: Accepts the current AI ghost text and commits it to the buffer
+    pub fn accept_ai_suggestion(&mut self) -> bool {
+        if let Some(suggestion) = self.ai_ghost_text.take() {
+            self.insert(&suggestion);
+            self.version += 1;
+            return true;
+        }
+        false
+    }
+
+    /// Agentic Primitive: Discards the current AI suggestion
+    pub fn discard_ai_suggestion(&mut self) {
+        self.ai_ghost_text = None;
+        self.version += 1;
+    }
+
+    // ── Layer 2: Speculative Transaction Logic ───────────────────────────────
+
+    pub fn start_speculative_session(&mut self) {
+        self.speculative_transaction_active = true;
+    }
+
+    pub fn is_speculative_active(&self) -> bool {
+        self.speculative_transaction_active
+    }
+
+    pub fn commit_speculative(&mut self) {
+        if !self.speculative_transaction_active { return; }
+        
+        // 🔱 Sync Live Map (Instant O(M))
+        for span in &mut self.provenance_map.spans {
+            if span.author == crate::history::transaction::Author::AiPending {
+                span.author = crate::history::transaction::Author::AiSuggested;
+            }
+        }
+        // 🔱 De-fragment markers after mass-update
+        self.provenance_map.coalesce();
+
+        // 🔱 Sync History (for persistence and correct undo/redo)
+        for i in (0..self.history.undo_stack_len()).rev() {
+            let txn = self.history.get_transaction_mut(i);
+            let mut modified = false;
+
+            // 1. Update individual edits
+            for edit in &mut txn.edits {
+                if edit.author == crate::history::transaction::Author::AiPending {
+                    edit.author = crate::history::transaction::Author::AiSuggested;
+                    modified = true;
+                }
+            }
+
+            // 2. Update snapshots for perfect state restoration
+            for span in &mut txn.provenance_before.spans {
+                if span.author == crate::history::transaction::Author::AiPending {
+                    span.author = crate::history::transaction::Author::AiSuggested;
+                    modified = true;
+                }
+            }
+            for span in &mut txn.provenance_after.spans {
+                if span.author == crate::history::transaction::Author::AiPending {
+                    span.author = crate::history::transaction::Author::AiSuggested;
+                    modified = true;
+                }
+            }
+
+            if modified {
+                txn.provenance_before.coalesce();
+                txn.provenance_after.coalesce();
+            } else {
+                // If this transaction has no pending edits, we've likely hit the start of the session
+                break;
+            }
+        }
+
+        self.speculative_transaction_active = false;
+        self.version += 1;
+    }
+
+    /// Reverts all AiPending edits in the buffer and removes them from history.
+    pub fn rollback_speculative(&mut self) {
+        if !self.speculative_transaction_active { return; }
+
+        while let Some(txn) = self.history.last_transaction() {
+            let is_pending = txn.edits.iter().any(|e| e.author == crate::history::transaction::Author::AiPending);
+            if is_pending {
+                self.undo();
+                // Pop it from the redo stack too, so it's fully gone
+                self.history.pop_redo();
+            } else {
+                break;
+            }
+        }
+
+        self.speculative_transaction_active = false;
+        self.version += 1;
+    }
+
+    /// 🚀 NEW: Optimized Line-based authorship for Renderer
+    pub fn get_line_authorship_spans(&self, line_idx: usize) -> Vec<crate::history::transaction::ProvenanceSpan> {
+        let (start, end) = self.buffer().line_byte_range(line_idx).unwrap_or((0, 0));
+        self.provenance_map.authorship_spans(start, end)
     }
 
     pub fn set_selections(&mut self, selections: Vec<Selection>) {
@@ -310,7 +458,7 @@ impl Editor {
                 old_text: self.buffer().slice_bytes(offset.value(), self.buffer().point_to_offset(end_pt).value()).to_string(),
                 new_text: text.to_string(),
                 cursor_offset: None,
-                author: crate::history::transaction::Author::AiSuggested,
+                author: crate::history::transaction::Author::AiPending,
             });
         }
 
@@ -319,8 +467,15 @@ impl Editor {
             .map(|s| (self.buffer().point_to_offset(s.start).value(), self.buffer().point_to_offset(s.end).value()))
             .collect();
 
-        // Apply edits to buffer and update selections
+        let provenance_before = self.provenance_map.clone();
         let (actual_edits, selection_offsets_after) = self.apply_edits_internal(edits);
+        
+        // 🌳 Sync Live Provenance Markers
+        for edit in actual_edits.iter().rev() {
+            self.provenance_map.apply_edit(edit.offset.value(), edit.old_text.len(), edit.new_text.len(), edit.author);
+        }
+        let provenance_after = self.provenance_map.clone();
+
         let new_buffer = self.buffer().clone();
 
         // 🚀 STREAMING CORE: If this is the FIRST token of the stream, push a new transaction.
@@ -332,6 +487,8 @@ impl Editor {
                     actual_edits,
                     selection_offsets_before.iter().map(|&(s, _)| s).collect(),
                     selection_offsets_after.iter().map(|&(s, _)| s).collect(),
+                    provenance_before,
+                    provenance_after,
                 );
                 self.history.push(start_buf.clone(), new_buffer, transaction);
             } else {
@@ -341,6 +498,8 @@ impl Editor {
                     for edit in actual_edits {
                         last_txn.append_edit(edit, final_offsets.clone());
                     }
+                    // Sync the marker map in the transaction too
+                    last_txn.provenance_after = provenance_after;
                     self.history.update_current(new_buffer);
                 }
             }
@@ -364,11 +523,9 @@ impl Editor {
         for edit in &mut edits {
             if edit.author == crate::history::transaction::Author::Human {
                 let off = edit.offset.value();
-                // Check author at current offset AND character to the left (boundary sticky)
-                let is_ai = self.history.author_at(off).map(|(_, a)| a)
-                    .or_else(|| self.history.author_at(off.saturating_sub(1)).map(|(_, a)| a))
-                    .map(|a| a == crate::history::transaction::Author::AiSuggested || a == crate::history::transaction::Author::AiModified)
-                    .unwrap_or(false);
+                // 🌳 Optimization: Use high-speed provenance_map instead of history scanning
+                let author = self.provenance_map.author_at(off);
+                let is_ai = author == crate::history::transaction::Author::AiSuggested || author == crate::history::transaction::Author::AiModified;
 
                 if is_ai {
                     edit.author = crate::history::transaction::Author::AiModified;
@@ -384,7 +541,15 @@ impl Editor {
             ))
             .collect();
 
+        let provenance_before = self.provenance_map.clone();
         let (actual_edits, selection_offsets_after) = self.apply_edits_internal(edits);
+        
+        // 🌳 Sync Live Provenance Markers (Bottom-to-Top to keep offsets stable during batch)
+        for edit in actual_edits.iter().rev() {
+            self.provenance_map.apply_edit(edit.offset.value(), edit.old_text.len(), edit.new_text.len(), edit.author);
+        }
+        let provenance_after = self.provenance_map.clone();
+
         let new_buffer = self.buffer().clone();
 
         // Push TRANSACTION
@@ -392,6 +557,8 @@ impl Editor {
             actual_edits,
             selection_offsets_before.iter().map(|&(s, _)| s).collect(),
             selection_offsets_after.iter().map(|&(s, _)| s).collect(),
+            provenance_before,
+            provenance_after,
         );
         self.history.push(old_buffer, new_buffer, transaction);
 
@@ -481,6 +648,33 @@ impl Editor {
         self.selections.sort_by_key(|s| s.range().0);
 
         (edits, selection_offsets_after)
+    }
+
+    /// Agentic Primitive: Applies AI-generated code to the current selection or cursor.
+    /// Tags all edits with Author::AiModified for provenance tracking.
+    pub fn apply_ai_edit(&mut self, text: &str) {
+        self.flush_pending_insert();
+        self.flush_pending_delete();
+
+        let mut edits = Vec::new();
+        for selection in &self.selections {
+            let (start_pt, end_pt) = selection.range();
+            let s_off = self.buffer().point_to_offset(start_pt);
+            let e_off = self.buffer().point_to_offset(end_pt);
+
+            edits.push(crate::history::transaction::RawEdit {
+                offset: s_off,
+                old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
+                new_text: text.to_string(),
+                cursor_offset: None,
+                author: crate::history::transaction::Author::AiModified,
+            });
+        }
+
+        if !edits.is_empty() {
+            self.execute_edits(edits);
+            self.last_insert_time = Instant::now();
+        }
     }
 
     pub fn insert(&mut self, text: &str) {
@@ -792,6 +986,10 @@ impl Editor {
                     new_end_position: self.buffer().offset_to_point(Offset(new_end_off)),
                 });
             }
+
+            // 3. Restore Provenance State
+            self.provenance_map = transaction.provenance_before;
+            
             self.version += 1;
         }
     }
@@ -824,6 +1022,10 @@ impl Editor {
                     new_end_position: self.buffer().offset_to_point(Offset(new_end_off)),
                 });
             }
+
+            // 3. Restore Provenance State
+            self.provenance_map = transaction.provenance_after;
+            
             self.version += 1;
         }
     }

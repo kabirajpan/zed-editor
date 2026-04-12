@@ -279,28 +279,64 @@ impl ViewportRenderer {
                         line_num_color,
                     );
 
-                    // ── Create Galley for the entire line ───────────────────
+                    // ── Create Galley with Layer 2: Ghost Text Support ──────
                     let mut job = LayoutJob::default();
-                    if highlights.is_empty() {
-                        job.append(&line, 0.0, TextFormat::simple(font_id.clone(), Color32::WHITE));
+                    let line_start_val = editor.buffer().point_to_offset(crate::buffer::Point::new(row, 0)).value();
+                    
+                    // 🔱 Layer 2 Optimization: Fetch authorship spans for the whole line once
+                    let authorship = if editor.is_speculative_active() || editor.ai_ghost_text.is_some() {
+                        editor.get_line_authorship_spans(row)
                     } else {
-                        let chars: Vec<char> = line.chars().collect();
+                        Vec::new()
+                    };
+
+                    if highlights.is_empty() {
+                        if authorship.is_empty() {
+                            job.append(&line, 0.0, TextFormat::simple(font_id.clone(), Color32::WHITE));
+                        } else {
+                            for span in &authorship {
+                                let start_rel = span.offset.saturating_sub(line_start_val);
+                                let end_rel = span.end().saturating_sub(line_start_val);
+                                let text_slice = &line[start_rel.min(line.len())..end_rel.min(line.len())];
+                                
+                                let mut format = TextFormat::simple(font_id.clone(), Color32::WHITE);
+                                if span.author == crate::history::transaction::Author::AiPending {
+                                    format.color = Color32::from_rgb(120, 120, 120);
+                                    format.italics = true;
+                                }
+                                job.append(text_slice, 0.0, format);
+                            }
+                        }
+                    } else {
+                        // Pass 2: Merging Syntax Highlights with Ghost Provenance
                         let mut last_end = 0;
                         for &(start, end, color) in &highlights {
                             if last_end < start {
-                                let text: String = chars[last_end..start.min(chars.len())].iter().collect();
-                                job.append(&text, 0.0, TextFormat::simple(font_id.clone(), Color32::WHITE));
+                                let text_slice = &line[last_end..start.min(line.len())];
+                                job.append(text_slice, 0.0, TextFormat::simple(font_id.clone(), Color32::WHITE));
                             }
-                            let span_end = end.min(chars.len());
+                            
+                            let span_end = end.min(line.len());
                             if start < span_end {
-                                let text: String = chars[start..span_end].iter().collect();
-                                job.append(&text, 0.0, TextFormat::simple(font_id.clone(), color));
+                                // Efficient check: Is this syntax span currently pending AI approval?
+                                let is_ghost = authorship.iter().any(|p_span| {
+                                    let abs_start = line_start_val + start;
+                                    p_span.author == crate::history::transaction::Author::AiPending && abs_start >= p_span.offset && abs_start < p_span.end()
+                                });
+
+                                let mut format = TextFormat::simple(font_id.clone(), color);
+                                if is_ghost {
+                                    format.color = Color32::from_gray(120);
+                                    format.italics = true;
+                                }
+                                let text_slice = &line[start..span_end];
+                                job.append(text_slice, 0.0, format);
                             }
                             last_end = span_end;
                         }
-                        if last_end < chars.len() {
-                            let text: String = chars[last_end..].iter().collect();
-                            job.append(&text, 0.0, TextFormat::simple(font_id.clone(), Color32::WHITE));
+                        if last_end < line.len() {
+                            let text_slice = &line[last_end..];
+                            job.append(text_slice, 0.0, TextFormat::simple(font_id.clone(), Color32::WHITE));
                         }
                     }
                     
@@ -364,6 +400,25 @@ impl ViewportRenderer {
                                 0.0,
                                 Color32::from_rgba_unmultiplied(255, 255, 255, (cursor_alpha * 255.0) as u8),
                             );
+
+                            // 👻 3. Ghost Text (AI Suggestion)
+                            if let Some(ghost) = &editor.ai_ghost_text {
+                                if !ghost.is_empty() {
+                                    let ghost_color = Color32::from_rgb(100, 100, 110);
+                                    let ghost_font = FontId::new(14.0, egui::FontFamily::Monospace);
+                                    
+                                    // Only show the first line of multi-line ghost text inline for now
+                                    let display_ghost = ghost.lines().next().unwrap_or("");
+                                    
+                                    painter.text(
+                                        Pos2::new(text_start_x + cursor_x + 4.0, y),
+                                        egui::Align2::LEFT_TOP,
+                                        display_ghost,
+                                        ghost_font,
+                                        ghost_color,
+                                    );
+                                }
+                            }
                         }
                     }
 

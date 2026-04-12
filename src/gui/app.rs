@@ -16,10 +16,17 @@ enum LoadingState {
     Error(String),
 }
 
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SidebarTab {
-    Investigator,
-    Chat,
+pub struct AiPermissionPool {
+    pub read_granted: bool,
+    pub write_granted: bool,
+}
+
+impl AiPermissionPool {
+    pub fn none() -> Self {
+        Self { read_granted: false, write_granted: false }
+    }
 }
 
 pub struct GuiApp {
@@ -51,10 +58,7 @@ pub struct GuiApp {
     ai_stream_index: usize,
     ai_stream_timer: f32,
     
-    // Layer 1 Investigation
-    show_debug_panel: bool,
-
-    // Real AI Provider
+    // Real AI Provider (for inline completions)
     ai_provider_type: crate::ai::provider::ProviderType,
     ai_api_key: String,
     ai_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
@@ -62,11 +66,11 @@ pub struct GuiApp {
     // Layer 1.1: Proper Hardening
     last_pie_sync: Instant,
 
-    // Phase 2: AI Chat Sidecar
-    sidebar_tab: SidebarTab,
-    chat_history: Vec<crate::ai::chat::ChatMessage>,
-    chat_input: String,
-    chat_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    // Phase 3: Multi-Panel System
+    pub panel_manager: crate::gui::panels::PanelManager,
+
+    // Phase 4: Security Layer
+    pub ai_permissions: AiPermissionPool,
 }
 
 impl GuiApp {
@@ -100,15 +104,12 @@ impl GuiApp {
             ai_stream_tokens: Vec::new(),
             ai_stream_index: 0,
             ai_stream_timer: 0.0,
-            show_debug_panel: false,
             ai_provider_type: crate::ai::provider::ProviderType::Anthropic,
             ai_api_key: String::new(),
             ai_receiver: None,
             last_pie_sync: Instant::now(),
-            sidebar_tab: SidebarTab::Chat,
-            chat_history: Vec::new(),
-            chat_input: String::new(),
-            chat_receiver: None,
+            panel_manager: crate::gui::panels::PanelManager::new(),
+            ai_permissions: AiPermissionPool::none(),
         }
     }
 
@@ -161,7 +162,13 @@ impl GuiApp {
 
         // ── Layer 1 Investigator Shortcut (Ctrl+I) ───────────────────────────
         if key == egui::Key::I && modifiers.command {
-            self.show_debug_panel = !self.show_debug_panel;
+            self.panel_manager.right_panel.is_visible = !self.panel_manager.right_panel.is_visible;
+            if self.panel_manager.right_panel.is_visible {
+               self.manager.focus.set(crate::manager::FocusTarget::RightPanel);
+               self.manager.panels.right_open = true;
+            } else {
+               self.manager.panels.right_open = false;
+            }
             return;
         }
 
@@ -333,8 +340,10 @@ impl GuiApp {
             }
 
             egui::Key::L if modifiers.ctrl => {
-                self.show_debug_panel = true;
-                self.sidebar_tab = SidebarTab::Chat;
+                self.panel_manager.right_panel.is_visible = true;
+                self.panel_manager.right_panel.active_tab = crate::gui::panels::right::RightPanelTab::Chat;
+                self.manager.panels.right_open = true;
+                self.manager.focus.set(crate::manager::FocusTarget::RightPanel);
                 // Focus the chat input on next frame
                 _ctx.memory_mut(|mem| mem.request_focus(egui::Id::new("chat_input")));
             }
@@ -580,44 +589,72 @@ impl eframe::App for GuiApp {
             }
         }
 
-        // ── Real AI Token Handling (Editor) ──────────────────────────────────
+        // ── Real AI Token Handling (Layer 2: Speculative Transaction) ────────
         if let Some(ref mut rx) = self.ai_receiver {
             while let Ok(token) = rx.try_recv() {
+                if !self.editor.is_speculative_active() {
+                    self.editor.start_speculative_session();
+                }
                 self.editor.insert_ai_stream(&token);
                 self.renderer.invalidate_from_line(self.editor.cursor().row);
                 self.auto_scroll = true;
-            }
-        }
-
-        // ── AI Sidecar Token Handling (Chat) ──────────────────────────────────
-        if let Some(ref mut rx) = self.chat_receiver {
-            while let Ok(token) = rx.try_recv() {
-                if let Some(last_msg) = self.chat_history.last_mut() {
-                    if last_msg.role == crate::ai::chat::MessageRole::Assistant {
-                        last_msg.content.push_str(&token);
-                    } else {
-                        self.chat_history.push(crate::ai::chat::ChatMessage::assistant(token));
-                    }
-                } else {
-                    self.chat_history.push(crate::ai::chat::ChatMessage::assistant(token));
-                }
+                self.status_message = "🤖 AI Drafting... [Enter] Commit, [Esc] Rollback".to_string();
             }
         }
 
 
-        // ── Tab key (consumed before general input) ───────────────────────────
+        let mut enter_pressed_speculative = false;
         let mut tab_pressed = false;
         let mut shift_tab_pressed = false;
         ctx.input_mut(|i| {
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
-                tab_pressed = true;
+            // Only consume Tab if AI is "offering" something
+            if self.editor.is_speculative_active() || self.editor.ai_ghost_text.is_some() {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+                    tab_pressed = true;
+                }
+                if i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab) {
+                    shift_tab_pressed = true;
+                }
             }
-            if i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab) {
-                shift_tab_pressed = true;
+
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                if self.editor.is_speculative_active() {
+                    self.editor.rollback_speculative();
+                    self.status_message = "AI suggestion rolled back.".to_string();
+                } else if self.editor.ai_ghost_text.is_some() {
+                    self.editor.discard_ai_suggestion();
+                    self.status_message = "AI suggestion discarded.".to_string();
+                }
+            }
+            
+            // Only consume Enter if we are in a Review Session
+            if self.editor.is_speculative_active() {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                    enter_pressed_speculative = true;
+                }
             }
         });
+
+        if enter_pressed_speculative {
+            self.editor.commit_speculative();
+            self.status_message = "✨ AI changes committed.".to_string();
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+        }
+
         if tab_pressed {
-            self.handle_key(egui::Key::Tab, egui::Modifiers::NONE, ctx);
+            if self.editor.is_speculative_active() {
+                self.editor.commit_speculative();
+                self.status_message = "✨ AI changes committed.".to_string();
+            } else if self.editor.ai_ghost_text.is_some() {
+                self.editor.accept_ai_suggestion();
+                self.status_message = "✨ Suggestion applied.".to_string();
+            } else {
+                self.handle_key(egui::Key::Tab, egui::Modifiers::NONE, ctx);
+            }
         }
         if shift_tab_pressed {
             self.handle_key(egui::Key::Tab, egui::Modifiers::SHIFT, ctx);
@@ -637,7 +674,10 @@ impl eframe::App for GuiApp {
                     egui::Event::Text(text) => {
                         // 🛡️ Filter out control characters that shouldn't come through Text events
                         // (Tab and Enter are handled via Event::Key)
-                        if text != "\t" && text != "\r" && text != "\n" {
+                        // Only handle if NO UI widget has focus (e.g. Chat Input)
+                        // 🛡️ Lenient Input Guard: Only block Editor if another panel (like Chat) is explicitly active
+                        let is_chat_active = self.manager.focus.is_focused(crate::manager::FocusTarget::RightPanel);
+                        if !is_chat_active && text != "\t" && text != "\r" && text != "\n" {
                             self.handle_text_input(text);
                         }
                     }
@@ -660,8 +700,10 @@ impl eframe::App for GuiApp {
             }
         });
 
-        for (key, modifiers) in keys_to_handle {
-            self.handle_key(key, modifiers, ctx);
+        if !self.manager.focus.is_focused(crate::manager::FocusTarget::RightPanel) {
+            for (key, modifiers) in keys_to_handle {
+                self.handle_key(key, modifiers, ctx);
+            }
         }
 
         if self.pending_copy || do_copy {
@@ -677,8 +719,34 @@ impl eframe::App for GuiApp {
             self.do_paste(text);
         }
 
-        // ── Top menu bar ──────────────────────────────────────────────────────
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+            // ── AI Review Bar (Layer 2) ──────────────────────────────────────
+            let ghost_lines = self.editor.ai_ghost_text.as_ref().map(|g| g.lines().count());
+            
+            if let Some(lines) = ghost_lines {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(40, 50, 90))
+                    .inner_margin(4.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("🤖 AI Draft ready").color(egui::Color32::WHITE).strong());
+                            ui.add_space(8.0);
+                            
+                            if ui.button("✅ [Tab] Accept").clicked() {
+                                self.editor.accept_ai_suggestion();
+                            }
+                            if ui.button("❌ [Esc] Discard").clicked() {
+                                self.editor.discard_ai_suggestion();
+                            }
+                            
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new(format!("{} lines proposed", lines)).weak());
+                            });
+                        });
+                    });
+                ui.separator();
+            }
+
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("📄 New").clicked() {
@@ -760,8 +828,16 @@ impl eframe::App for GuiApp {
             });
         });
 
-        // ── Layer 1 Investigator (Right Side Panel) ──────────────────────────
-        self.show_layer1_investigator(ctx);
+        // ── Multi-Panel System Render ────────────────────────────────────────
+        self.panel_manager.right_panel.render(
+            ctx, 
+            &mut self.editor, 
+            &mut self.ai_provider_type, 
+            &mut self.ai_api_key,
+            self.renderer.highlighter.tree(),
+            &mut self.manager,
+            &mut self.ai_permissions,
+        );
 
         // ── Status bar ────────────────────────────────────────────────────────
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -849,10 +925,36 @@ impl eframe::App for GuiApp {
                 self.auto_scroll,
             );
 
-            if ui.rect_contains_pointer(ui.max_rect()) {
-                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Text);
-            }
             self.auto_scroll = false;
+            
+            // ── Layer 2: Speculative Transaction Review Bar ──────────────
+            if self.editor.is_speculative_active() {
+                egui::Area::new(egui::Id::new("review_bar"))
+                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0))
+                    .show(ctx, |ui| {
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgb(30, 30, 40))
+                            .rounding(10.0)
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 150, 255)))
+                            .inner_margin(8.0)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("🤖 AI Proposal ready").strong().color(egui::Color32::WHITE));
+                                    ui.separator();
+                                    
+                                    if ui.button(egui::RichText::new("✅ Accept (Enter)").color(egui::Color32::GREEN)).clicked() {
+                                        self.editor.commit_speculative();
+                                        self.status_message = "✨ AI changes committed.".to_string();
+                                    }
+                                    
+                                    if ui.button(egui::RichText::new("❌ Discard (Esc)").color(egui::Color32::LIGHT_RED)).clicked() {
+                                        self.editor.rollback_speculative();
+                                        self.status_message = "AI suggestion rolled back.".to_string();
+                                    }
+                                });
+                            });
+                    });
+            }
 
             // ── Click & Press handling ────────────────────────────────────
             
@@ -978,6 +1080,8 @@ impl GuiApp {
         if needs_key && self.ai_api_key.is_empty() {
             self.start_ai_simulation();
             self.status_message = format!("⚠️ No API Key found for {:?}. Using Mock Simulation.", self.ai_provider_type);
+        } else if !self.ai_permissions.read_granted || !self.ai_permissions.write_granted {
+            self.status_message = "🔒 Access Denied: Z3N requires both READ and WRITE permissions for inline AI. Please grant them in the Chat Panel.".to_string();
         } else {
             // 🔱 Layer 1.5: Intelligent Spacing Guard
             // Ensure we start on a new line if current line isn't empty (e.g. after a comment)
@@ -1002,21 +1106,35 @@ impl GuiApp {
         self.editor.start_ai_stream();
         self.status_message = format!("🤖 AI ({:?}) is thinking...", self.ai_provider_type);
 
+        let extension = self.current_file.as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .unwrap_or("text");
+
         let system_prompt = if let Some(tree) = self.renderer.highlighter.tree() {
             let cursor = self.editor.cursor();
             let offset = self.editor.buffer().point_to_offset(cursor).value();
             let node_path = self.editor.get_node_path_at(tree, offset);
             
-            format!("You are a high-performance code completion engine for the Z3N editor.
-You are currently coding inside this semantic path: {}
-Output ONLY the raw code required to complete the user's intent based on the context.
-NO EXPLANATIONS. NO MARKDOWN. NO INTRODUCTIONS.
-If the code is already complete, output nothing.", node_path)
+            format!("You are the core intelligence of Z3N, a state-of-the-art AI-native code editor.
+CRITICAL: You are currently working in a [{}] file. 
+You must output ONLY raw [{}] code. NEVER output JavaScript, Python, or Markdown unless the file type is explicitly one of those.
+Current semantic path (AST): {}
+
+TASK: Complete the code at the cursor.
+- Output ONLY raw code.
+- NO markdown backticks.
+- NO explanations.
+- Match existing indentation and style exactly.
+- If the code is already complete, output exactly nothing.", extension, extension, node_path)
         } else {
-            "You are a high-performance code completion engine for the Z3N editor.
-Output ONLY the raw code required to complete the user's intent based on the context.
-NO EXPLANATIONS. NO MARKDOWN. NO INTRODUCTIONS.
-If the code is already complete, output nothing.".to_string()
+            format!("You are the core intelligence of Z3N, a state-of-the-art AI-native code editor.
+CRITICAL: You are currently working in a [{}] file.
+You must output ONLY raw [{}] code.
+TASK: Complete the code at the cursor.
+- Output ONLY raw code.
+- NO markdown backticks.
+- Match existing indentation and style exactly.", extension, extension)
         };
 
         let user_prompt = format!("### PREFIX\n{}\n### CURSOR HERE\n### SUFFIX\n{}", prefix, suffix);
@@ -1031,248 +1149,5 @@ If the code is already complete, output nothing.".to_string()
         provider.stream_completion(system_prompt, user_prompt, self.ai_api_key.clone(), tx);
     }
 
-    fn show_layer1_investigator(&mut self, ctx: &egui::Context) {
-        if !self.show_debug_panel { return; }
 
-        egui::SidePanel::right("investigator")
-            .resizable(true)
-            .default_width(320.0)
-            .show(ctx, |ui| {
-                ui.add_space(8.0);
-                
-                // ── Tab Bar ──────────────────────────────────────────────────
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Chat, "🤖 Chat");
-                    ui.selectable_value(&mut self.sidebar_tab, SidebarTab::Investigator, "🔍 Investigator");
-                });
-                ui.separator();
-
-                match self.sidebar_tab {
-                    SidebarTab::Investigator => self.render_investigator_tab(ui),
-                    SidebarTab::Chat => self.render_chat_tab(ui),
-                }
-            });
-    }
-
-    fn render_chat_tab(&mut self, ui: &mut egui::Ui) {
-        ui.vertical(|ui| {
-            // ── Message Area (Top, flexible) ─────────────────────────────────
-            let available_height = ui.available_height();
-            let input_area_height = 80.0; 
-            
-            egui::ScrollArea::vertical()
-                .max_height(available_height - input_area_height)
-                .auto_shrink([false; 2])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    if self.chat_history.is_empty() {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(20.0);
-                            ui.label(egui::RichText::new("🤖 Z3N Intelligence Agent").strong().size(18.0));
-                            ui.label(egui::RichText::new("How can I help you plan your code today?").weak());
-                        });
-                    }
-
-                    for msg in &self.chat_history {
-                        let is_user = msg.role == crate::ai::chat::MessageRole::User;
-                        let bg = if is_user { 
-                            egui::Color32::from_rgb(50, 60, 110) // Deep Blue
-                        } else { 
-                            egui::Color32::from_rgb(35, 35, 45) // Slate
-                        };
-
-                        ui.horizontal(|ui| {
-                            if is_user { ui.add_space(32.0); }
-                            
-                            egui::Frame::none()
-                                .fill(bg)
-                                .rounding(12.0)
-                                .inner_margin(10.0)
-                                .show(ui, |ui| {
-                                    ui.set_max_width(ui.available_width() - 32.0);
-                                    ui.label(egui::RichText::new(&msg.content).color(egui::Color32::WHITE));
-                                });
-                            
-                            if !is_user { ui.add_space(32.0); }
-                        });
-                        ui.add_space(8.0);
-                    }
-                });
-
-            ui.separator();
-
-            // ── Input Area (Bottom, fixed height) ────────────────────────────
-            ui.add_space(4.0);
-            let input_response = ui.add(
-                egui::TextEdit::multiline(&mut self.chat_input)
-                    .hint_text("Send a message (Ctrl+Enter to send)...")
-                    .id(egui::Id::new("chat_input"))
-                    .desired_rows(2)
-                    .margin(egui::vec2(8.0, 8.0))
-                    .lock_focus(true)
-            );
-
-            ui.horizontal(|ui| {
-                ui.small("Shift+Enter for newline");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("🚀 Send").clicked() || 
-                       (input_response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command)) {
-                        if !self.chat_input.trim().is_empty() {
-                            self.trigger_chat();
-                        }
-                    }
-                });
-            });
-        });
-    }
-
-    fn trigger_chat(&mut self) {
-        let text = std::mem::take(&mut self.chat_input);
-        self.chat_history.push(crate::ai::chat::ChatMessage::user(text));
-        
-        // Add system context if first message
-        if self.chat_history.len() == 1 {
-            let context = "You are a helpful AI assistant inside the Z3N code editor. Use the provided code context to answer accurately.";
-            self.chat_history.insert(0, crate::ai::chat::ChatMessage::system(context));
-        }
-
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.chat_receiver = Some(rx);
-
-        let provider: Box<dyn crate::ai::provider::ModelProvider> = match self.ai_provider_type {
-            crate::ai::provider::ProviderType::Anthropic => Box::new(crate::ai::provider::AnthropicProvider),
-            crate::ai::provider::ProviderType::Ollama => Box::new(crate::ai::provider::OllamaProvider),
-            crate::ai::provider::ProviderType::Grok => Box::new(crate::ai::provider::GrokProvider),
-            crate::ai::provider::ProviderType::Groq => Box::new(crate::ai::provider::GroqProvider),
-        };
-
-        let history = self.chat_history.clone();
-        provider.stream_chat(history, self.ai_api_key.clone(), tx);
-    }
-
-    fn render_investigator_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("🔍 Layer 1 Investigator");
-        ui.add_space(8.0);
-
-                // ── Provenance ──────────────────────────────────────────────
-                ui.collapsing("🧬 Provenance (Authorship)", |ui| {
-                    let cursor = self.editor.cursor();
-                    let offset = self.editor.buffer().point_to_offset(cursor).value();
-                    // Interrogate the character to the left of the cursor (standard provenance behavior)
-                    let interrogate_offset = offset.saturating_sub(1);
-                    let (author, timestamp) = self.editor.provenance_at(interrogate_offset);
-
-                    ui.horizontal(|ui| {
-                        ui.label("Cursor Origin:");
-                        let (text, color) = match author {
-                            crate::history::transaction::Author::Human => ("HUMAN", egui::Color32::from_rgb(100, 255, 100)),
-                            crate::history::transaction::Author::AiSuggested => ("AI_SUGGESTED", egui::Color32::from_rgb(255, 180, 0)),
-                            crate::history::transaction::Author::AiModified => ("AI_MODIFIED", egui::Color32::from_rgb(255, 100, 100)),
-                        };
-                        ui.label(egui::RichText::new(text).color(color).strong());
-                    });
-
-                    if let Some(ts) = timestamp {
-                        let elapsed = ts.elapsed().as_secs();
-                        let time_str = if elapsed < 60 {
-                            format!("{}s ago", elapsed)
-                        } else {
-                            format!("{}m ago", elapsed / 60)
-                        };
-                        ui.label(egui::RichText::new(format!("Modified: {}", time_str)).small().weak());
-                    }
-
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new("Interrogating the byte under the cursor to find its birth certificate.").small().italics());
-                });
-
-                ui.add_space(12.0);
-
-                // ── PIE (Semantic Deltas) ───────────────────────────────────
-                ui.collapsing("📊 PIE (Semantic Deltas)", |ui| {
-                    let deltas = self.editor.last_semantic_deltas();
-                    ui.label(format!("Active Deltas: {}", deltas.len()));
-                    
-                    egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                        if deltas.is_empty() {
-                            ui.label(egui::RichText::new("No recent changes. Press Ctrl+S to sync PIE.").weak());
-                        } else {
-                            for delta in deltas {
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new(format!("[{:?}]", delta.edit_type)).strong());
-                                    ui.label(&delta.node_path);
-                                });
-                                let range_text = if let Some((s, e)) = delta.new_byte_range {
-                                    format!("Bytes: {}..{}", s, e)
-                                } else if let Some((s, e)) = delta.old_byte_range {
-                                    format!("Deleted Bytes: {}..{}", s, e)
-                                } else {
-                                    "Range: Unknown".to_string()
-                                };
-                                ui.label(egui::RichText::new(range_text).small().weak());
-                                ui.separator();
-                            }
-                        }
-                    });
-                    
-                    if ui.button("Sync Now (PIE)").clicked() {
-                        // Trigger manual sync logic
-                        if let Some(tree) = self.renderer.highlighter.tree() {
-                            let text = self.editor.buffer().to_string();
-                            self.editor.update_semantic_deltas(tree, &text);
-                        }
-                    }
-                });
-
-                ui.add_space(12.0);
-
-                // ── Performance / Rope ──────────────────────────────────────
-                ui.collapsing("⚙️ High-Performance Rope", |ui| {
-                    ui.label(format!("Buffer Length: {} bytes", self.editor.buffer().len()));
-                    ui.label(format!("Line Count: {}", self.editor.line_count()));
-                    ui.label("Memory: O(1) edits, O(log N) splits.");
-                });
-
-                ui.add_space(12.0);
-
-                // ── AI Settings ──────────────────────────────────────────────
-                ui.collapsing("🤖 AI Settings", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Provider:");
-                        egui::ComboBox::from_id_source("ai_provider")
-                            .selected_text(format!("{:?}", self.ai_provider_type))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.ai_provider_type, crate::ai::provider::ProviderType::Anthropic, "Anthropic (Claude)");
-                                ui.selectable_value(&mut self.ai_provider_type, crate::ai::provider::ProviderType::Ollama, "Ollama (Local)");
-                                ui.selectable_value(&mut self.ai_provider_type, crate::ai::provider::ProviderType::Grok, "Grok (xAI)");
-                                ui.selectable_value(&mut self.ai_provider_type, crate::ai::provider::ProviderType::Groq, "Groq (LPU Speed)");
-                            });
-                    });
-
-                    let needs_key = self.ai_provider_type == crate::ai::provider::ProviderType::Anthropic || 
-                                    self.ai_provider_type == crate::ai::provider::ProviderType::Grok ||
-                                    self.ai_provider_type == crate::ai::provider::ProviderType::Groq;
-
-                    if needs_key {
-                        ui.horizontal(|ui| {
-                            ui.label("API Key:");
-                            let hint = match self.ai_provider_type {
-                                crate::ai::provider::ProviderType::Anthropic => "sk-ant-...",
-                                crate::ai::provider::ProviderType::Grok => "xai-...",
-                                crate::ai::provider::ProviderType::Groq => "gsk-...",
-                                _ => "api-key",
-                            };
-                            ui.add(egui::TextEdit::singleline(&mut self.ai_api_key).password(true).hint_text(hint));
-                        });
-                    } else {
-                        ui.label(egui::RichText::new("Ensure Ollama is running at localhost:11434").small().color(egui::Color32::from_rgb(150, 150, 150)));
-                    }
-                    
-                    ui.add_space(4.0);
-                    if ui.button("🚀 Trigger AI Suggestion").clicked() {
-                        self.trigger_ai();
-                    }
-                });
-
-    }
 }

@@ -10,6 +10,8 @@ pub enum Author {
     AiSuggested,
     /// AI-generated code that was later modified by a human.
     AiModified,
+    /// AI-generated code that is currently in a "draft" state and pending user approval.
+    AiPending,
 }
 
 /// A single atomic edit in the document
@@ -28,19 +30,27 @@ pub struct Transaction {
     pub edits: Vec<RawEdit>,
     pub cursor_offsets_before: Vec<usize>,
     pub cursor_offsets_after: Vec<usize>,
+    pub provenance_before: ProvenanceMap, // snapshot before edit
+    pub provenance_after: ProvenanceMap,  // snapshot after edit
     pub timestamp: Instant,          // 🕒 Temporal Tracking
 }
 
 impl Transaction {
     pub fn new(
-        edits: Vec<RawEdit>,
+        mut edits: Vec<RawEdit>,
         cursor_offsets_before: Vec<usize>,
         cursor_offsets_after: Vec<usize>,
+        provenance_before: ProvenanceMap,
+        provenance_after: ProvenanceMap,
     ) -> Self {
+        // 🔱 Optimization: Pre-sort edits by offset to allow $O(\log N)$ range-lookups during rendering
+        edits.sort_unstable_by_key(|e| e.offset.value());
         Self {
             edits,
             cursor_offsets_before,
             cursor_offsets_after,
+            provenance_before,
+            provenance_after,
             timestamp: Instant::now(),
         }
     }
@@ -49,5 +59,157 @@ impl Transaction {
         self.edits.push(edit);
         self.cursor_offsets_after = cursor_after;
         self.timestamp = Instant::now(); // Update timestamp on batch modification
+    }
+}
+
+/// 🌳 NEW: Live Provenance Spread (Spatial Metadata)
+/// A contiguous range of text with a common author.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ProvenanceSpan {
+    pub offset: usize,
+    pub len: usize,
+    pub author: Author,
+}
+
+impl ProvenanceSpan {
+    pub fn new(offset: usize, len: usize, author: Author) -> Self {
+        Self { offset, len, author }
+    }
+    
+    pub fn end(&self) -> usize {
+        self.offset + self.len
+    }
+}
+
+/// A collection of non-overlapping, contiguous authorship spans.
+#[derive(Debug, Clone, Default)]
+pub struct ProvenanceMap {
+    pub spans: Vec<ProvenanceSpan>,
+}
+
+impl ProvenanceMap {
+    pub fn new() -> Self {
+        Self { spans: Vec::new() }
+    }
+
+    /// O(log N) lookup of the author at a specific byte offset.
+    pub fn author_at(&self, offset: usize) -> Author {
+        match self.spans.binary_search_by(|s| {
+            if offset < s.offset {
+                std::cmp::Ordering::Greater
+            } else if offset >= s.end() {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }) {
+            Ok(idx) => self.spans[idx].author,
+            Err(_) => Author::Human,
+        }
+    }
+
+    /// O(log N) search for the first overlapping span, then linear scan of visible range.
+    pub fn authorship_spans(&self, start: usize, end: usize) -> Vec<ProvenanceSpan> {
+        let mut result = Vec::new();
+        
+        // Use binary search to find the first span that ends after 'start'
+        let start_idx = self.spans.partition_point(|s| s.end() <= start);
+        
+        for i in start_idx..self.spans.len() {
+            let span = &self.spans[i];
+            if span.offset >= end { break; }
+            
+            let s_start = span.offset.max(start);
+            let s_end = span.end().min(end);
+            
+            if s_start < s_end {
+                result.push(ProvenanceSpan::new(s_start, s_end - s_start, span.author));
+            }
+        }
+        result
+    }
+
+    /// Explicitly merge contiguous spans of the same author.
+    pub fn coalesce(&mut self) {
+        if self.spans.is_empty() { return; }
+        let old_spans = std::mem::take(&mut self.spans);
+        for span in old_spans {
+            if let Some(last) = self.spans.last_mut() {
+                if last.author == span.author && last.end() == span.offset {
+                    last.len += span.len;
+                    continue;
+                }
+            }
+            if span.len > 0 {
+                self.spans.push(span);
+            }
+        }
+    }
+
+    /// O(N) update of the map for a given edit.
+    /// This is called in execute_edits to keep the markers shifted and merged.
+    pub fn apply_edit(&mut self, offset: usize, old_len: usize, new_len: usize, author: Author) {
+        // 1. Shift and split existing spans
+        let mut new_spans = Vec::new();
+        
+        // Handle "New text" insertion
+        let mut text_inserted = false;
+
+        if self.spans.is_empty() {
+            self.spans.push(ProvenanceSpan::new(0, new_len, author));
+            return;
+        }
+
+        for span in &self.spans {
+            if span.end() <= offset {
+                // Span is BEFORE the edit
+                new_spans.push(*span);
+            } else if span.offset >= offset + old_len {
+                // Span is AFTER the edit - shift it
+                let mut shifted = *span;
+                shifted.offset = (shifted.offset as isize + (new_len as isize - old_len as isize)) as usize;
+                new_spans.push(shifted);
+            } else {
+                // 🔱 OVERLAP: The edit intersects this span.
+                // We split the span or shrink it.
+                if span.offset < offset {
+                    new_spans.push(ProvenanceSpan::new(span.offset, offset - span.offset, span.author));
+                }
+                
+                // If we haven't inserted the new text span yet, do it now
+                if !text_inserted {
+                    new_spans.push(ProvenanceSpan::new(offset, new_len, author));
+                    text_inserted = true;
+                }
+
+                if span.end() > offset + old_len {
+                    let rem_start = offset + old_len;
+                    let rem_len = span.end() - rem_start;
+                    let mut shifted_rem = ProvenanceSpan::new(rem_start, rem_len, span.author);
+                    shifted_rem.offset = (shifted_rem.offset as isize + (new_len as isize - old_len as isize)) as usize;
+                    new_spans.push(shifted_rem);
+                }
+            }
+        }
+
+        if !text_inserted {
+            // Find insertion point if map was empty or edit was at the very end
+            new_spans.push(ProvenanceSpan::new(offset, new_len, author));
+            new_spans.sort_by_key(|s| s.offset);
+        }
+
+        // 2. Coalesce contiguous spans of the same author
+        self.spans = Vec::new();
+        for span in new_spans {
+            if let Some(last) = self.spans.last_mut() {
+                if last.author == span.author && last.end() == span.offset {
+                    last.len += span.len;
+                    continue;
+                }
+            }
+            if span.len > 0 {
+                self.spans.push(span);
+            }
+        }
     }
 }

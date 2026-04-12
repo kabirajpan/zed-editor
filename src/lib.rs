@@ -10,6 +10,7 @@ pub mod syntax;
 pub mod tree;
 pub mod ui;
 pub mod util;
+pub mod ai;
 
 // Re-export commonly used types
 pub use buffer::{Buffer, Offset, Point};

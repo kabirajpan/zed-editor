@@ -42,6 +42,14 @@ impl SyntaxHighlighter {
         }
     }
 
+    pub fn tree(&self) -> Option<&Tree> {
+        self.parse_state.as_ref().map(|s| &s.tree)
+    }
+
+    pub fn text(&self) -> Option<&str> {
+        self.parse_state.as_ref().map(|s| s.text.as_str())
+    }
+
     /// Invalidate the highlight cache (line-level cache miss next frame).
     pub fn invalidate(&mut self) {
         self.highlight_cache = None;
@@ -276,6 +284,11 @@ impl SyntaxHighlighter {
         (visible_start..visible_end)
             .filter_map(|line| all_lines.remove(&line).map(|s| (line, s)))
             .collect()
+    }
+
+    pub fn get_code_context(&self, byte_offset: usize) -> Option<crate::syntax::CodeContext> {
+        let state = self.parse_state.as_ref()?;
+        Some(crate::syntax::CodeContext::new(&state.tree, byte_offset, &state.text))
     }
 
     pub fn set_theme(&mut self, theme: SyntaxTheme) {

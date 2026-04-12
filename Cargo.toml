@@ -38,8 +38,15 @@ tree-sitter-javascript = "0.21"
 tree-sitter-python = "0.21"
 tree-sitter-highlight = "0.22"
 
+# AI & Networking
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio = { version = "1.37", features = ["full"] }
+serde_json = "1.0"
+futures-util = "0.3"
+
 [dev-dependencies]
 criterion = "0.5"
+tempfile = "3.10"
 
 [[bench]]
 name = "rope_bench"

@@ -91,6 +91,34 @@ impl History {
         self.undo_stack.last_mut().map(|(_, txn)| txn)
     }
 
+    /// Returns the author and transaction information for the character at the specified byte offset.
+    /// Walks backwards through history and translates coordinates to find the origin.
+    pub fn author_at(&self, mut offset: usize) -> Option<(&Transaction, crate::history::transaction::Author)> {
+        for (_, transaction) in self.undo_stack.iter().rev() {
+            // We need to see if this transaction was the "birth" of the byte at 'offset'
+            // Edits within a transaction are simultaneous, but we can treat them as ordered reverse for coordinate shift.
+            let mut sorted_edits = transaction.edits.clone();
+            sorted_edits.sort_unstable_by_key(|e| e.offset.value());
+
+            for edit in sorted_edits.iter().rev() {
+                let edit_start = edit.offset.value();
+                let edit_len = edit.new_text.len();
+                let old_len = edit.old_text.len();
+
+                if offset >= edit_start && offset < edit_start + edit_len {
+                    // Match found: This specific edit in this transaction created this byte!
+                    return Some((transaction, edit.author));
+                }
+
+                // Coordinate translation: where was this offset BEFORE this edit?
+                if offset >= edit_start + edit_len {
+                    offset = (offset as isize - (edit_len as isize - old_len as isize)) as usize;
+                }
+            }
+        }
+        None
+    }
+
     /// Expose current Arc<Buffer> so editor can push it to redo stack directly.
     pub fn current_arc(&self) -> Arc<Buffer> {
         self.current.clone()

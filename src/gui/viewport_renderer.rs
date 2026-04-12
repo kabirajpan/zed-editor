@@ -84,6 +84,10 @@ impl ViewportRenderer {
         self.highlighter.invalidate();
     }
 
+    pub fn get_code_context(&self, byte_offset: usize) -> Option<crate::syntax::CodeContext> {
+        self.highlighter.get_code_context(byte_offset)
+    }
+
     pub fn invalidate_line(&mut self, line: usize) {
         self.line_cache.remove(&line);
         self.highlighter.invalidate();

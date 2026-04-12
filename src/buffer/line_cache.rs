@@ -463,16 +463,16 @@ mod tests {
     #[test]
     fn test_zero_allocation_cache() {
         let mut cache = LineOffsetCache::new(1000);
-        let mut editor = crate::buffer::rope_engine::RopeEditor::new();
+        let mut rope = Rope::new();
         let mut buffer = ReusableBuffer::new();
 
         // Test empty case
         let lines = [];
-        let offsets = cache.get_offsets_zero_alloc(&lines, &mut editor, &mut buffer);
+        let offsets = cache.get_offsets_zero_alloc(&lines, &rope, &mut buffer);
         assert_eq!(offsets.len(), 0);
 
         // Test cache expansion
-        cache.ensure_range_cached(&mut editor, 100..150);
+        cache.ensure_range_cached(&rope, 100..150);
         assert!(!cache.cached_range.is_empty());
     }
 

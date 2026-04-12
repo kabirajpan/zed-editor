@@ -1,7 +1,8 @@
 use super::selection::{Selection, SelectionMode};
 use crate::buffer::{Buffer, Offset, Point};
-use crate::history::{History, Transaction};
+use crate::history::History;
 use crate::syntax::IndentCalculator;
+use crate::syntax::delta_logger::{DeltaGenerator, SemanticDelta};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,14 @@ pub struct Editor {
     // 🛡️ Double-Insert Guard
     last_insert_text: Option<String>,
     last_insert_time: Instant,
+
+    // ── Streaming AI Tokens ──────────────────────────────────────────────────
+    is_streaming: bool,
+    streaming_start_buffer: Option<Buffer>,
+
+    // ── Layer 1.3: PIE (Positional Integrity Encoding) ───────────────────────
+    pub delta_generator: DeltaGenerator,
+    pub last_semantic_deltas: Vec<SemanticDelta>,
 }
 
 impl Editor {
@@ -61,6 +70,10 @@ impl Editor {
             pending_edit_events: Vec::new(),
             last_insert_text: None,
             last_insert_time: Instant::now(),
+            is_streaming: false,
+            streaming_start_buffer: None,
+            delta_generator: DeltaGenerator::new(),
+            last_semantic_deltas: Vec::new(),
         }
     }
 
@@ -82,6 +95,10 @@ impl Editor {
             pending_edit_events: Vec::new(),
             last_insert_text: None,
             last_insert_time: Instant::now(),
+            is_streaming: false,
+            streaming_start_buffer: None,
+            delta_generator: DeltaGenerator::new(),
+            last_semantic_deltas: Vec::new(),
         }
     }
 
@@ -95,6 +112,64 @@ impl Editor {
 
     pub fn buffer(&self) -> &Buffer {
         self.history.current()
+    }
+
+    // ── Layer 1.4: Provenance & Debug Helpers ───────────────────────────────
+
+    /// Peeks at the author of the most recent transaction. (Legacy, use provenance_at)
+    pub fn last_provenance(&self) -> crate::history::transaction::Author {
+        self.history.last_transaction()
+            .and_then(|t| t.edits.first().map(|e| e.author))
+            .unwrap_or(crate::history::transaction::Author::Human)
+    }
+
+    /// Returns high-fidelity provenance for the character at the specified offset.
+    pub fn provenance_at(&self, offset: usize) -> (crate::history::transaction::Author, Option<Instant>) {
+        if let Some((txn, author)) = self.history.author_at(offset) {
+            (author, Some(txn.timestamp))
+        } else {
+            (crate::history::transaction::Author::Human, None)
+        }
+    }
+
+    /// Exposes the most recent semantic deltas calculated by PIE.
+    pub fn last_semantic_deltas(&self) -> &[crate::syntax::delta_logger::SemanticDelta] {
+        &self.last_semantic_deltas
+    }
+
+    /// Resolves a byte offset to its hierarchical AST node path. (Layer 1.1)
+    /// Example: "Module -> ImplBlock -> Function -> Call"
+    pub fn get_node_path_at(&self, tree: &tree_sitter::Tree, offset: usize) -> String {
+        let mut node = tree.root_node().descendant_for_byte_range(offset, offset);
+        let mut path = Vec::new();
+
+        while let Some(current) = node {
+            let kind = current.kind();
+            if kind != "source_file" {
+                path.push(kind.to_string());
+            }
+            node = current.parent();
+        }
+
+        path.reverse();
+        if path.is_empty() {
+            "root".to_string()
+        } else {
+            path.join(" -> ")
+        }
+    }
+
+    // ── Layer 1.3: PIE Logic ───────────────────────────────────────────────
+
+    /// Snapshots the current AST state to establish a baseline for the next sync.
+    pub fn sync_semantic_checkpoint(&mut self, tree: &tree_sitter::Tree, text: &str) {
+        self.delta_generator.snapshot(tree, text);
+        self.last_semantic_deltas.clear();
+    }
+
+    /// Computes which semantic nodes have changed since the last checkpoint.
+    pub fn update_semantic_deltas(&mut self, tree: &tree_sitter::Tree, text: &str) {
+        self.last_semantic_deltas = self.delta_generator.generate_deltas(tree, text);
     }
 
     pub fn cursor(&self) -> Point {
@@ -212,12 +287,126 @@ impl Editor {
 
     /// Central hub for all document edits. 
     /// Ensures perfect multi-cursor synchronization and transactional history.
+    // ── Streaming AI Tokens ──────────────────────────────────────────────────
+
+    pub fn start_ai_stream(&mut self) {
+        if self.is_streaming { return; }
+        self.is_streaming = true;
+        self.streaming_start_buffer = Some(self.buffer().clone());
+    }
+
+    pub fn insert_ai_stream(&mut self, text: &str) {
+        if !self.is_streaming {
+            self.start_ai_stream();
+        }
+
+        let mut edits = Vec::new();
+        for selection in &self.selections {
+            let (_start_pt, end_pt) = selection.range();
+            let offset = self.buffer().point_to_offset(end_pt);
+            
+            edits.push(crate::history::transaction::RawEdit {
+                offset,
+                old_text: self.buffer().slice_bytes(offset.value(), self.buffer().point_to_offset(end_pt).value()).to_string(),
+                new_text: text.to_string(),
+                cursor_offset: None,
+                author: crate::history::transaction::Author::AiSuggested,
+            });
+        }
+
+        let _old_buffer = self.buffer().clone();
+        let selection_offsets_before: Vec<(usize, usize)> = self.selections.iter()
+            .map(|s| (self.buffer().point_to_offset(s.start).value(), self.buffer().point_to_offset(s.end).value()))
+            .collect();
+
+        // Apply edits to buffer and update selections
+        let (actual_edits, selection_offsets_after) = self.apply_edits_internal(edits);
+        let new_buffer = self.buffer().clone();
+
+        // 🚀 STREAMING CORE: If this is the FIRST token of the stream, push a new transaction.
+        // If it's a subsequent token, MERGE it into the last transaction.
+        if let Some(start_buf) = &self.streaming_start_buffer {
+            // If we just started, we push the very first token to establish the entry
+            if self.history.last_transaction().is_none() || self.history.current().len() == start_buf.len() {
+                 let transaction = crate::history::transaction::Transaction::new(
+                    actual_edits,
+                    selection_offsets_before.iter().map(|&(s, _)| s).collect(),
+                    selection_offsets_after.iter().map(|&(s, _)| s).collect(),
+                );
+                self.history.push(start_buf.clone(), new_buffer, transaction);
+            } else {
+                // Subsequent tokens: MERGE into the last transaction
+                if let Some(last_txn) = self.history.last_transaction_mut() {
+                    let final_offsets: Vec<usize> = selection_offsets_after.iter().map(|&(s, _)| s).collect();
+                    for edit in actual_edits {
+                        last_txn.append_edit(edit, final_offsets.clone());
+                    }
+                    self.history.update_current(new_buffer);
+                }
+            }
+        }
+
+        self.version += 1;
+        self.last_edit_time = Instant::now();
+    }
+
+    pub fn finish_ai_stream(&mut self) {
+        self.is_streaming = false;
+        self.streaming_start_buffer = None;
+    }
+
+    /// Central hub for all document edits. 
+    /// Ensures perfect multi-cursor synchronization and transactional history.
     fn execute_edits(&mut self, mut edits: Vec<crate::history::transaction::RawEdit>) {
         if edits.is_empty() { return; }
 
+        // 🔱 AI-Modified Detection: If a human is editing, check if they overlap with AI code
+        for edit in &mut edits {
+            if edit.author == crate::history::transaction::Author::Human {
+                let off = edit.offset.value();
+                // Check author at current offset AND character to the left (boundary sticky)
+                let is_ai = self.history.author_at(off).map(|(_, a)| a)
+                    .or_else(|| self.history.author_at(off.saturating_sub(1)).map(|(_, a)| a))
+                    .map(|a| a == crate::history::transaction::Author::AiSuggested || a == crate::history::transaction::Author::AiModified)
+                    .unwrap_or(false);
+
+                if is_ai {
+                    edit.author = crate::history::transaction::Author::AiModified;
+                }
+            }
+        }
+
+        let old_buffer = self.buffer().clone();
+        let selection_offsets_before: Vec<(usize, usize)> = self.selections.iter()
+            .map(|s| (
+                self.buffer().point_to_offset(s.start).value(), 
+                self.buffer().point_to_offset(s.end).value()
+            ))
+            .collect();
+
+        let (actual_edits, selection_offsets_after) = self.apply_edits_internal(edits);
+        let new_buffer = self.buffer().clone();
+
+        // Push TRANSACTION
+        let transaction = crate::history::transaction::Transaction::new(
+            actual_edits,
+            selection_offsets_before.iter().map(|&(s, _)| s).collect(),
+            selection_offsets_after.iter().map(|&(s, _)| s).collect(),
+        );
+        self.history.push(old_buffer, new_buffer, transaction);
+
+        self.version += 1;
+        self.last_edit_time = Instant::now();
+    }
+
+    /// Primary logic for applying edits and shifting selections.
+    /// Returns the finalized edits (sorted) and the new selection offsets.
+    fn apply_edits_internal(&mut self, mut edits: Vec<crate::history::transaction::RawEdit>) 
+        -> (Vec<crate::history::transaction::RawEdit>, Vec<(usize, usize)>) 
+    {
         let old_buffer = self.buffer().clone();
         
-        // 1. Capture original selection offsets (both start and end)
+        // 1. Capture original selection offsets
         let selection_offsets_before: Vec<(usize, usize)> = self.selections.iter()
             .map(|s| (
                 self.buffer().point_to_offset(s.start).value(), 
@@ -233,49 +422,31 @@ impl Editor {
 
         for &(old_start, old_end) in &selection_offsets_before {
             let is_point_cursor = old_start == old_end;
-
-            // Helper to calculate shift for a specific point
             let calc_shift = |old_off: usize, is_sticky_right: bool| -> usize {
-                // Check for explicit override at this position (or if the point is swallowed by a replacement)
                 for edit in &edits {
                     let edit_start = edit.offset.value();
                     let edit_end = edit_start + edit.old_text.len();
-                    
                     if old_off >= edit_start && old_off <= edit_end {
-                        if let Some(target) = edit.cursor_offset {
-                            return target;
-                        }
+                        if let Some(target) = edit.cursor_offset { return target; }
                     }
                 }
-
                 let mut total_shift: isize = 0;
                 for edit in &edits {
                     let edit_start = edit.offset.value();
                     let edit_end = edit_start + edit.old_text.len();
                     let delta = edit.new_text.len() as isize - edit.old_text.len() as isize;
-
                     if edit_end < old_off {
-                        // 1. Edit is strictly before the point
                         total_shift += delta;
                     } else if edit_start == old_off {
-                        // 2. Edit is exactly at the point (Insertion boundary)
-                        if is_sticky_right {
-                            total_shift += delta;
-                        }
+                        if is_sticky_right { total_shift += delta; }
                     } else if edit_start < old_off {
-                        // 3. Edit OVERLAPS/SWALLOWS the point
-                        // Snap the point to the start of the deletion
                         total_shift -= (old_off - edit_start) as isize;
-                        // A point can only be swallowed once.
                         break; 
                     }
                 }
                 (old_off as isize + total_shift).max(0) as usize
             };
-
-            let _min_off = old_start.min(old_end);
             let max_off = old_start.max(old_end);
-
             let new_start = calc_shift(old_start, is_point_cursor || old_start == max_off);
             let new_end = calc_shift(old_end, is_point_cursor || old_end == max_off);
             selection_offsets_after.push((new_start, new_end));
@@ -286,12 +457,8 @@ impl Editor {
         current_buf.invalidate_cache();
         for edit in edits.iter().rev() {
             let end_off = Offset(edit.offset.value() + edit.old_text.len());
-            if edit.old_text.len() > 0 {
-                current_buf.delete(edit.offset, end_off);
-            }
-            if edit.new_text.len() > 0 {
-                current_buf.insert(edit.offset, &edit.new_text);
-            }
+            if edit.old_text.len() > 0 { current_buf.delete(edit.offset, end_off); }
+            if edit.new_text.len() > 0 { current_buf.insert(edit.offset, &edit.new_text); }
 
             self.pending_edit_events.push(EditEvent {
                 start_byte: edit.offset.value(),
@@ -302,31 +469,18 @@ impl Editor {
                 new_end_position: current_buf.offset_to_point(Offset(edit.offset.value() + edit.new_text.len())),
             });
         }
-        
-        let new_buffer = self.buffer().clone();
 
-        // 5. Update selections to their new synchronized positions
+        // 5. Update selections
         let mut new_selections = Vec::new();
         for &(new_start, new_end) in &selection_offsets_after {
-            let start = self.buffer().offset_to_point(Offset(new_start));
-            let end = self.buffer().offset_to_point(Offset(new_end));
+            let start = current_buf.offset_to_point(Offset(new_start));
+            let end = current_buf.offset_to_point(Offset(new_end));
             new_selections.push(Selection::new(start, end));
         }
         self.selections = new_selections;
-        // self.normalize_selections(); // Wait, if I preserve selections, normalise might merge them
-        // For now I'll just sort them to keep multi-cursor happy.
         self.selections.sort_by_key(|s| s.range().0);
 
-        // 6. Push TRANSACTION
-        let transaction = crate::history::transaction::Transaction::new(
-            edits,
-            selection_offsets_before.iter().map(|&(s, _)| s).collect(), // History only tracks cursors for now
-            selection_offsets_after.iter().map(|&(s, _)| s).collect(),
-        );
-        self.history.push(old_buffer, new_buffer, transaction);
-
-        self.version += 1;
-        self.last_edit_time = Instant::now();
+        (edits, selection_offsets_after)
     }
 
     pub fn insert(&mut self, text: &str) {
@@ -360,13 +514,15 @@ impl Editor {
                         old_text: String::new(),
                         new_text: text.to_string(),
                         cursor_offset: None,
-                    });
+                author: crate::history::transaction::Author::Human,
+});
                     edits.push(crate::history::transaction::RawEdit {
                         offset: e_off,
                         old_text: String::new(),
                         new_text: closer.to_string(),
                         cursor_offset: None,
-                    });
+                author: crate::history::transaction::Author::Human,
+});
                 } else {
                     // 1b. Selection Overwrite
                     edits.push(crate::history::transaction::RawEdit {
@@ -375,6 +531,7 @@ impl Editor {
                         new_text: text.to_string(),
                         // 🛡️ Selection Replace: Move cursor to the END of the replacement
                         cursor_offset: Some(s_off.value() + text.len()),
+                        author: crate::history::transaction::Author::Human,
                     });
                 }
             } else {
@@ -438,6 +595,7 @@ impl Editor {
                     old_text: String::new(),
                     new_text: text_to_insert,
                     cursor_offset: cursor_override,
+                    author: crate::history::transaction::Author::Human,
                 });
             }
         }
@@ -473,6 +631,7 @@ impl Editor {
                 old_text: String::new(),
                 new_text: opener.to_string(),
                 cursor_offset: None,
+                author: crate::history::transaction::Author::Human,
             });
 
             edits.push(crate::history::transaction::RawEdit {
@@ -480,6 +639,7 @@ impl Editor {
                 old_text: String::new(),
                 new_text: closer.to_string(),
                 cursor_offset: None,
+                author: crate::history::transaction::Author::Human,
             });
         }
 
@@ -550,6 +710,7 @@ impl Editor {
                     old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
                     new_text: String::new(),
                     cursor_offset: Some(s_off.value()),
+                    author: crate::history::transaction::Author::Human,
                 });
             } else {
                 let before = self.move_point_left(cursor);
@@ -561,7 +722,8 @@ impl Editor {
                     old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
                     new_text: String::new(),
                     cursor_offset: None,
-                });
+                author: crate::history::transaction::Author::Human,
+});
             }
         }
 
@@ -590,7 +752,8 @@ impl Editor {
                 old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
                 new_text: String::new(),
                 cursor_offset: None,
-            });
+                author: crate::history::transaction::Author::Human,
+});
         }
 
         self.execute_edits(edits);
@@ -1120,13 +1283,14 @@ impl Editor {
         // 1. Determine the query from the primary (last) selection
         let primary_idx = self.selections.len() - 1;
         let primary = self.selections[primary_idx].clone();
-        
-        let query = if primary.is_empty() {
+        let search_query = if primary.is_empty() {
             // Case A: Select current word
             let (start, end) = self.word_range_at(primary.end);
             if start == end { return; }
             self.selections[primary_idx] = Selection::new(start, end);
-            return;
+            let start_off = self.buffer().point_to_offset(start);
+            let end_off = self.buffer().point_to_offset(end);
+            self.buffer().slice_bytes(start_off.value(), end_off.value())
         } else {
             // Case B: Extract text of current selection
             let (start_p, end_p) = primary.range();
@@ -1135,15 +1299,15 @@ impl Editor {
             self.buffer().slice_bytes(start_off.value(), end_off.value())
         };
 
-        if query.is_empty() { return; }
+        if search_query.is_empty() { return; }
 
         // 2. Search for next match
-        let content = self.buffer().to_string();
+        let text_content = self.buffer().to_string();
         let last_sel_end = self.buffer().point_to_offset(self.selections.last().unwrap().end);
         
-        let next_pos = if let Some(pos) = content[last_sel_end.value()..].find(&query) {
+        let next_pos = if let Some(pos) = text_content[last_sel_end.value()..].find(&search_query) {
             Some(last_sel_end.value() + pos)
-        } else if let Some(pos) = content[..last_sel_end.value()].find(&query) {
+        } else if let Some(pos) = text_content[..last_sel_end.value()].find(&search_query) {
             // Wrap around
             Some(pos)
         } else {
@@ -1153,7 +1317,7 @@ impl Editor {
         // 3. Add new selection if found and NOT overlapping
         if let Some(start_idx) = next_pos {
             let start = self.buffer().offset_to_point(Offset(start_idx));
-            let end = self.buffer().offset_to_point(Offset(start_idx + query.len()));
+            let end = self.buffer().offset_to_point(Offset(start_idx + search_query.len()));
             let new_sel = Selection::new(start, end);
             
             // Critical: Check for overlap with ANY existing selection
@@ -1204,7 +1368,8 @@ impl Editor {
                     old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
                     new_text: String::new(),
                     cursor_offset: None,
-                });
+                author: crate::history::transaction::Author::Human,
+});
             }
         }
 
@@ -1243,7 +1408,8 @@ impl Editor {
                 old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
                 new_text: String::new(),
                 cursor_offset: None,
-            });
+                author: crate::history::transaction::Author::Human,
+});
         }
 
         self.execute_edits(edits);
@@ -1271,7 +1437,8 @@ impl Editor {
                 old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
                 new_text: String::new(),
                 cursor_offset: None,
-            });
+                author: crate::history::transaction::Author::Human,
+});
         }
         
         self.execute_edits(edits);
@@ -1299,7 +1466,8 @@ impl Editor {
                 old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
                 new_text: String::new(),
                 cursor_offset: None,
-            });
+                author: crate::history::transaction::Author::Human,
+});
         }
 
         self.execute_edits(edits);
@@ -1332,6 +1500,7 @@ impl Editor {
                 old_text: String::new(),
                 new_text: indent_str.clone(),
                 cursor_offset: None,
+                author: crate::history::transaction::Author::Human,
             });
         }
 
@@ -1377,6 +1546,7 @@ impl Editor {
                         old_text: line.chars().take(spaces_to_remove).collect(),
                         new_text: String::new(),
                         cursor_offset: None,
+                author: crate::history::transaction::Author::Human,
                     });
                 }
             }
@@ -1427,7 +1597,8 @@ impl Editor {
                 old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
                 new_text: String::new(),
                 cursor_offset: None,
-            });
+                author: crate::history::transaction::Author::Human,
+});
 
             // 3. Insert it after end_row
             let target_off = if end_row + 1 < self.buffer().line_count() {
@@ -1441,6 +1612,7 @@ impl Editor {
                 old_text: String::new(),
                 new_text: prev_line_text,
                 cursor_offset: None,
+                author: crate::history::transaction::Author::Human,
             });
         }
 
@@ -1500,7 +1672,8 @@ impl Editor {
                 old_text: self.buffer().slice_bytes(s_off.value(), e_off.value()),
                 new_text: String::new(),
                 cursor_offset: None,
-            });
+                author: crate::history::transaction::Author::Human,
+});
 
             // 3. Insert it before start_row
             let target_off = self.buffer().point_to_offset(Point::new(start_row, 0));
@@ -1509,6 +1682,7 @@ impl Editor {
                 old_text: String::new(),
                 new_text: next_line_text,
                 cursor_offset: None,
+                author: crate::history::transaction::Author::Human,
             });
         }
 
@@ -1580,7 +1754,8 @@ impl Editor {
                     old_text: String::new(),
                     new_text: block_text,
                     cursor_offset: None,
-                });
+                author: crate::history::transaction::Author::Human,
+});
                 // Current selections STAY at the same row (which is now the duplicate)
             } else {
                 // 🚀 DUPLICATE DOWN: Insert below end_row
@@ -1590,7 +1765,8 @@ impl Editor {
                     old_text: String::new(),
                     new_text: block_text,
                     cursor_offset: None,
-                });
+                author: crate::history::transaction::Author::Human,
+});
                 // Current selections move to the NEW block (shift DOWN by block_height)
                 for r in start_row..=end_row {
                     row_shifts.insert(r, block_height as isize);
@@ -1692,6 +1868,7 @@ impl Editor {
                         old_text: String::new(),
                         new_text: prefix_with_space.clone(),
                         cursor_offset: None,
+                author: crate::history::transaction::Author::Human,
                     });
                 } else {
                     // Uncomment: Look for "TOKEN " or "TOKEN"
@@ -1709,6 +1886,7 @@ impl Editor {
                             old_text: line_suffix[0..to_remove].to_string(),
                             new_text: String::new(),
                             cursor_offset: None,
+                author: crate::history::transaction::Author::Human,
                         });
                     }
                 }
@@ -1742,6 +1920,7 @@ impl Editor {
             old_text: self.buffer().to_string(),
             new_text: new_text.to_string(),
             cursor_offset: None,
+                author: crate::history::transaction::Author::Human,
         };
         
         self.execute_edits(vec![edit]);
